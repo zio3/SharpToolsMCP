@@ -1758,5 +1758,233 @@ public static class ModificationTools {
         }, logger, nameof(FindAndReplace_Stateless), cancellationToken);
     }
 
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(MoveMember_Stateless), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
+    [Description("Stateless version of MoveMember. Moves a member (property, field, method, nested type, etc.) from one type/namespace to another. Requires the solution path since member moves need full solution context.")]
+    public static async Task<string> MoveMember_Stateless(
+        StatelessWorkspaceFactory workspaceFactory,
+        ICodeModificationService modificationService,
+        IFuzzyFqnLookupService fuzzyLookup,
+        ILogger<ModificationToolsLogCategory> logger,
+        [Description("Path to the solution (.sln) file containing both the source member and destination type.")] string solutionPath,
+        [Description("FQN of the member to move.")] string fullyQualifiedMemberName,
+        [Description("FQN of the destination type or namespace where the member should be moved.")] string fullyQualifiedDestinationTypeOrNamespaceName,
+        CancellationToken cancellationToken = default) {
+        
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            ErrorHandlingHelpers.ValidateStringParameter(solutionPath, nameof(solutionPath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedMemberName, nameof(fullyQualifiedMemberName), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedDestinationTypeOrNamespaceName, nameof(fullyQualifiedDestinationTypeOrNamespaceName), logger);
+            
+            // Validate solution file exists and has correct extension
+            if (!File.Exists(solutionPath)) {
+                throw new McpException($"Solution file not found: {solutionPath}");
+            }
+            if (!Path.GetExtension(solutionPath).Equals(".sln", StringComparison.OrdinalIgnoreCase)) {
+                throw new McpException($"File '{solutionPath}' is not a .sln file.");
+            }
+
+            logger.LogInformation("Executing '{MoveMember_Stateless}' moving {MemberName} to {DestinationName} in solution {SolutionPath}",
+                nameof(MoveMember_Stateless), fullyQualifiedMemberName, fullyQualifiedDestinationTypeOrNamespaceName, solutionPath);
+
+            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(solutionPath);
+            
+            try {
+                Solution solution;
+                if (context is Solution sol) {
+                    solution = sol;
+                } else if (context is Project proj) {
+                    solution = proj.Solution;
+                } else {
+                    var dynamicContext = (dynamic)context;
+                    solution = ((Project)dynamicContext.Project).Solution;
+                }
+                
+                // Find the source member symbol using fuzzy lookup
+                var tempSolutionManager = new StatelessSolutionManager(solution);
+                var sourceMemberMatches = await fuzzyLookup.FindMatchesAsync(fullyQualifiedMemberName, tempSolutionManager, cancellationToken);
+                var sourceMemberMatch = sourceMemberMatches.FirstOrDefault();
+                if (sourceMemberMatch == null) {
+                    throw new McpException($"No symbol found matching '{fullyQualifiedMemberName}'.");
+                }
+                
+                var sourceMemberSymbol = sourceMemberMatch.Symbol;
+                if (sourceMemberSymbol == null) {
+                    throw new McpException($"Could not find symbol '{fullyQualifiedMemberName}' in the workspace.");
+                }
+
+                if (sourceMemberSymbol is not (IFieldSymbol or IPropertySymbol or IMethodSymbol or IEventSymbol or INamedTypeSymbol { TypeKind: TypeKind.Class or TypeKind.Struct or TypeKind.Interface or TypeKind.Enum or TypeKind.Delegate })) {
+                    throw new McpException($"Symbol '{fullyQualifiedMemberName}' is not a movable member type. Only fields, properties, methods, events, and nested types can be moved.");
+                }
+
+                // Find the destination symbol
+                var destinationMatches = await fuzzyLookup.FindMatchesAsync(fullyQualifiedDestinationTypeOrNamespaceName, tempSolutionManager, cancellationToken);
+                var destinationMatch = destinationMatches.FirstOrDefault();
+                if (destinationMatch == null) {
+                    throw new McpException($"No symbol found matching '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
+                }
+                
+                var destinationSymbol = destinationMatch.Symbol;
+
+                if (destinationSymbol is not (INamedTypeSymbol or INamespaceSymbol)) {
+                    throw new McpException($"Destination '{fullyQualifiedDestinationTypeOrNamespaceName}' must be a type or namespace.");
+                }
+
+                // Get syntax references
+                var sourceSyntaxRef = sourceMemberSymbol.DeclaringSyntaxReferences.FirstOrDefault();
+                if (sourceSyntaxRef == null) {
+                    throw new McpException($"Could not find syntax reference for member '{fullyQualifiedMemberName}'.");
+                }
+
+                var sourceMemberNode = await sourceSyntaxRef.GetSyntaxAsync(cancellationToken);
+                if (sourceMemberNode is not MemberDeclarationSyntax memberDeclaration) {
+                    throw new McpException($"Source member '{fullyQualifiedMemberName}' is not a valid member declaration.");
+                }
+
+                Document currentSourceDocument = ToolHelpers.GetDocumentFromSyntaxNodeOrThrow(solution, sourceMemberNode);
+                Document destinationDocument;
+                INamedTypeSymbol? destinationTypeSymbol = null;
+                INamespaceSymbol? destinationNamespaceSymbol = null;
+
+                if (destinationSymbol is INamedTypeSymbol typeSym) {
+                    destinationTypeSymbol = typeSym;
+                    var destSyntaxRef = typeSym.DeclaringSyntaxReferences.FirstOrDefault();
+                    if (destSyntaxRef == null) {
+                        throw new McpException($"Could not find syntax reference for destination type '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
+                    }
+                    var destNode = await destSyntaxRef.GetSyntaxAsync(cancellationToken);
+                    destinationDocument = ToolHelpers.GetDocumentFromSyntaxNodeOrThrow(solution, destNode);
+                } else if (destinationSymbol is INamespaceSymbol nsSym) {
+                    destinationNamespaceSymbol = nsSym;
+                    var projectForDestination = solution.GetDocument(currentSourceDocument.Id)!.Project;
+                    var existingDoc = await FindExistingDocumentWithNamespaceAsync(projectForDestination, nsSym, cancellationToken);
+                    if (existingDoc != null) {
+                        destinationDocument = existingDoc;
+                    } else {
+                        var newDoc = await CreateDocumentForNamespaceAsync(projectForDestination, nsSym, cancellationToken);
+                        destinationDocument = newDoc;
+                        solution = newDoc.Project.Solution; // Update solution after adding a document
+                    }
+                } else {
+                    throw new McpException("Invalid destination symbol type.");
+                }
+
+                if (currentSourceDocument.Id == destinationDocument.Id && sourceMemberSymbol.ContainingSymbol.Equals(destinationSymbol, SymbolEqualityComparer.Default)) {
+                    throw new McpException($"Source and destination are the same. Member '{fullyQualifiedMemberName}' is already in '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
+                }
+
+                string memberName = GetMemberName(memberDeclaration);
+                INamedTypeSymbol? updatedDestinationTypeSymbol = null;
+                
+                if (destinationTypeSymbol != null) {
+                    // Re-resolve destinationTypeSymbol from the potentially updated solution
+                    var destinationDocumentFromCurrentSolution = solution.GetDocument(destinationDocument.Id)
+                        ?? throw new McpException($"Destination document '{destinationDocument.FilePath}' not found in current solution for symbol re-resolution.");
+                    var tempDestSymbol = await SymbolFinder.FindSymbolAtPositionAsync(destinationDocumentFromCurrentSolution, destinationTypeSymbol.Locations.First().SourceSpan.Start, cancellationToken);
+                    updatedDestinationTypeSymbol = tempDestSymbol as INamedTypeSymbol;
+                    if (updatedDestinationTypeSymbol == null) {
+                        throw new McpException($"Could not re-resolve destination type symbol '{destinationTypeSymbol.ToDisplayString()}' in the current solution state.");
+                    }
+                }
+
+                if (updatedDestinationTypeSymbol != null && !IsMemberAllowed(updatedDestinationTypeSymbol, memberDeclaration, memberName, cancellationToken)) {
+                    throw new McpException($"A member with the name '{memberName}' already exists in destination type '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
+                }
+
+                try {
+                    var actualDestinationDocument = solution.GetDocument(destinationDocument.Id)
+                        ?? throw new McpException($"Destination document '{destinationDocument.FilePath}' not found in current solution before adding member.");
+
+                    if (updatedDestinationTypeSymbol != null) {
+                        solution = await modificationService.AddMemberAsync(actualDestinationDocument.Id, updatedDestinationTypeSymbol, memberDeclaration, -1, cancellationToken);
+                    } else {
+                        if (destinationNamespaceSymbol == null) throw new McpException("Destination namespace symbol is null when expected for namespace move.");
+                        solution = await AddMemberToNamespaceAsync(actualDestinationDocument, destinationNamespaceSymbol, memberDeclaration, modificationService, cancellationToken);
+                    }
+
+                    // Re-acquire source document and node from the updated solution
+                    var sourceDocumentInCurrentSolution = solution.GetDocument(currentSourceDocument.Id)
+                        ?? throw new McpException("Source document not found in current solution after adding member to destination.");
+                    var syntaxRootOfSourceInCurrentSolution = await sourceDocumentInCurrentSolution.GetSyntaxRootAsync(cancellationToken)
+                        ?? throw new McpException("Could not get syntax root for source document in current solution.");
+
+                    // Find the source member node in the updated tree
+                    var sourceMemberNodeInCurrentTree = syntaxRootOfSourceInCurrentSolution.FindNode(sourceMemberNode.Span, findInsideTrivia: true, getInnermostNodeForTie: true);
+                    if (sourceMemberNodeInCurrentTree == null || !(sourceMemberNodeInCurrentTree is MemberDeclarationSyntax)) {
+                        // Fallback: Try to find by kind and name
+                        sourceMemberNodeInCurrentTree = syntaxRootOfSourceInCurrentSolution
+                            .DescendantNodes()
+                            .OfType<MemberDeclarationSyntax>()
+                            .FirstOrDefault(m => m.Kind() == memberDeclaration.Kind() && GetMemberName(m) == memberName);
+
+                        if (sourceMemberNodeInCurrentTree == null) {
+                            throw new McpException($"Failed to re-locate source member node '{memberName}' for removal after modifications.");
+                        }
+                    }
+
+                    solution = await RemoveMemberFromParentAsync(sourceDocumentInCurrentSolution, sourceMemberNodeInCurrentTree, modificationService, cancellationToken);
+
+                    // Apply changes
+                    if (!workspace.TryApplyChanges(solution)) {
+                        throw new McpException("Failed to apply changes to the workspace.");
+                    }
+
+                    // Get final documents for error checking
+                    var finalSolution = workspace.CurrentSolution;
+                    var finalSourceDocument = finalSolution.GetDocument(currentSourceDocument.Id);
+                    var finalDestinationDocument = finalSolution.GetDocument(destinationDocument.Id);
+
+                    StringBuilder errorBuilder = new StringBuilder();
+                    
+                    // Since we're stateless, we'll do a simple compilation check
+                    if (finalSourceDocument != null) {
+                        var sourceSemanticModel = await finalSourceDocument.GetSemanticModelAsync(cancellationToken);
+                        var sourceDiagnostics = sourceSemanticModel?.GetDiagnostics()
+                            .Where(d => d.Severity == DiagnosticSeverity.Error)
+                            .Take(5);
+                        
+                        if (sourceDiagnostics?.Any() == true) {
+                            errorBuilder.AppendLine($"Compilation errors in source file {finalSourceDocument.FilePath}:");
+                            foreach (var diag in sourceDiagnostics) {
+                                errorBuilder.AppendLine($"  - {diag.GetMessage()}");
+                            }
+                        }
+                    }
+
+                    if (finalDestinationDocument != null && finalDestinationDocument.Id != finalSourceDocument?.Id) {
+                        var destSemanticModel = await finalDestinationDocument.GetSemanticModelAsync(cancellationToken);
+                        var destDiagnostics = destSemanticModel?.GetDiagnostics()
+                            .Where(d => d.Severity == DiagnosticSeverity.Error)
+                            .Take(5);
+                        
+                        if (destDiagnostics?.Any() == true) {
+                            errorBuilder.AppendLine($"Compilation errors in destination file {finalDestinationDocument.FilePath}:");
+                            foreach (var diag in destDiagnostics) {
+                                errorBuilder.AppendLine($"  - {diag.GetMessage()}");
+                            }
+                        }
+                    }
+
+                    var sourceFilePathDisplay = finalSourceDocument?.FilePath ?? currentSourceDocument.FilePath ?? "unknown source file";
+                    var destinationFilePathDisplay = finalDestinationDocument?.FilePath ?? destinationDocument.FilePath ?? "unknown destination file";
+
+                    var locationInfo = sourceFilePathDisplay == destinationFilePathDisplay
+                        ? $"within {sourceFilePathDisplay}"
+                        : $"from {sourceFilePathDisplay} to {destinationFilePathDisplay}";
+
+                    var errorInfo = errorBuilder.Length > 0 ? $"\n\nCompilation status:\n{errorBuilder}" : "";
+
+                    return $"Successfully moved member '{memberName}' to '{fullyQualifiedDestinationTypeOrNamespaceName}' {locationInfo}.{errorInfo}";
+                    
+                } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
+                    logger.LogError(ex, "Failed to move member {MemberName} to {DestinationName}", fullyQualifiedMemberName, fullyQualifiedDestinationTypeOrNamespaceName);
+                    throw new McpException($"Failed to move member '{fullyQualifiedMemberName}' to '{fullyQualifiedDestinationTypeOrNamespaceName}': {ex.Message}", ex);
+                }
+                
+            } finally {
+                workspace.Dispose();
+            }
+        }, logger, nameof(MoveMember_Stateless), cancellationToken);
+    }
+
     #endregion
 }

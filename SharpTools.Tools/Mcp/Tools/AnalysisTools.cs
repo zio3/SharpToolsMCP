@@ -1250,6 +1250,14 @@ public static partial class AnalysisTools {
                                                 }
 
                                                 int matchStartPos = node.SpanStart + match.Index;
+                                                
+                                                // Defensive check for position range
+                                                if (matchStartPos < 0 || matchStartPos >= sourceText.Length) {
+                                                    logger.LogWarning("Match position {Position} is out of range for text length {Length} in file {FilePath}", 
+                                                        matchStartPos, sourceText.Length, filePath);
+                                                    continue;
+                                                }
+                                                
                                                 var matchLinePos = sourceText.Lines.GetLinePosition(matchStartPos);
                                                 int matchLineNumber = matchLinePos.Line + 1;
                                                 var matchLine = sourceText.Lines[matchLinePos.Line].ToString().Trim();
@@ -2400,6 +2408,14 @@ public static partial class AnalysisTools {
                                                     }
 
                                                     int matchStartPos = node.SpanStart + match.Index;
+                                                    
+                                                    // Defensive check for position range
+                                                    if (matchStartPos < 0 || matchStartPos >= sourceText.Length) {
+                                                        logger.LogWarning("Match position {Position} is out of range for text length {Length} in file {FilePath}", 
+                                                            matchStartPos, sourceText.Length, filePath);
+                                                        continue;
+                                                    }
+                                                    
                                                     var matchLinePos = sourceText.Lines.GetLinePosition(matchStartPos);
                                                     int matchLineNumber = matchLinePos.Line + 1;
                                                     var matchLine = sourceText.Lines[matchLinePos.Line].ToString().Trim();
@@ -2658,6 +2674,418 @@ public static partial class AnalysisTools {
                 workspace?.Dispose();
             }
         }, logger, nameof(SearchDefinitions_Stateless), cancellationToken);
+    }
+
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(AnalyzeComplexity_Stateless), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
+    [Description("Stateless version of AnalyzeComplexity. Deep analysis of code complexity metrics including cyclomatic complexity, cognitive complexity, method stats, coupling, and inheritance depth. Works without a pre-loaded solution.")]
+    public static async Task<string> AnalyzeComplexity_Stateless(
+        StatelessWorkspaceFactory workspaceFactory,
+        IComplexityAnalysisService complexityAnalysisService,
+        IFuzzyFqnLookupService fuzzyFqnLookupService,
+        ILogger<AnalysisToolsLogCategory> logger,
+        [Description("Path to a file, project, or solution containing the target.")] string contextPath,
+        [Description("The scope to analyze: 'method', 'class', or 'project'")] string scope,
+        [Description("The fully qualified name of the method/class, or project name to analyze")] string target,
+        CancellationToken cancellationToken = default) {
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            // Validate parameters
+            ErrorHandlingHelpers.ValidateStringParameter(contextPath, nameof(contextPath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(scope, nameof(scope), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(target, nameof(target), logger);
+
+            if (!new[] { "method", "class", "project" }.Contains(scope.ToLower())) {
+                throw new McpException($"Invalid scope '{scope}'. Must be 'method', 'class', or 'project'.");
+            }
+
+            logger.LogInformation("Executing '{AnalyzeComplexity_Stateless}' for: {Target} in context {ContextPath} (Scope: {Scope})",
+                nameof(AnalyzeComplexity_Stateless), target, contextPath, scope);
+
+            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(contextPath);
+            
+            try {
+                Solution solution;
+                if (context is Solution sol) {
+                    solution = sol;
+                } else if (context is Project proj) {
+                    solution = proj.Solution;
+                } else {
+                    var dynamicContext = (dynamic)context;
+                    solution = ((Project)dynamicContext.Project).Solution;
+                }
+
+                // Track metrics for the final report
+                var metrics = new Dictionary<string, object>();
+                var recommendations = new List<string>();
+
+                switch (scope.ToLower()) {
+                    case "method":
+                        // Use fuzzy lookup to find the method symbol
+                        var fuzzyMatches = await fuzzyFqnLookupService.FindMatchesAsync(target, new StatelessSolutionManager(solution), cancellationToken);
+                        var methodMatch = fuzzyMatches.FirstOrDefault(m => m.Symbol is IMethodSymbol);
+                        if (methodMatch?.Symbol is not IMethodSymbol foundMethodSymbol) {
+                            throw new McpException($"Method '{target}' not found in the workspace");
+                        }
+
+                        // Re-resolve the symbol from the current compilation to ensure it's part of the workspace
+                        var methodLocation = foundMethodSymbol.Locations.FirstOrDefault(l => l.IsInSource);
+                        if (methodLocation == null) {
+                            throw new McpException($"Method '{target}' has no source location");
+                        }
+
+                        var methodDocument = solution.GetDocument(methodLocation.SourceTree);
+                        if (methodDocument == null) {
+                            throw new McpException($"Could not find document for method '{target}'");
+                        }
+
+                        var methodSemanticModel = await methodDocument.GetSemanticModelAsync(cancellationToken);
+                        if (methodSemanticModel == null) {
+                            throw new McpException($"Could not get semantic model for method '{target}'");
+                        }
+
+                        var methodSyntaxNode = await methodLocation.SourceTree.GetRootAsync(cancellationToken);
+                        var methodNode = methodSyntaxNode.FindNode(methodLocation.SourceSpan);
+                        
+                        // Get the symbol from the current compilation
+                        var methodSymbol = methodSemanticModel.GetDeclaredSymbol(methodNode, cancellationToken) as IMethodSymbol;
+                        if (methodSymbol == null) {
+                            // Try getting the symbol at the location
+                            var symbolInfo = methodSemanticModel.GetSymbolInfo(methodNode, cancellationToken);
+                            methodSymbol = symbolInfo.Symbol as IMethodSymbol;
+                        }
+
+                        if (methodSymbol == null) {
+                            throw new McpException($"Could not resolve method '{target}' in the current compilation");
+                        }
+
+                        await complexityAnalysisService.AnalyzeMethodAsync(methodSymbol, metrics, recommendations, cancellationToken);
+                        break;
+
+                    case "class":
+                        // Use fuzzy lookup to find the type symbol
+                        var typeFuzzyMatches = await fuzzyFqnLookupService.FindMatchesAsync(target, new StatelessSolutionManager(solution), cancellationToken);
+                        var typeMatch = typeFuzzyMatches.FirstOrDefault(m => m.Symbol is INamedTypeSymbol);
+                        if (typeMatch?.Symbol is not INamedTypeSymbol foundTypeSymbol) {
+                            throw new McpException($"Type '{target}' not found in the workspace");
+                        }
+
+                        // Re-resolve the symbol from the current compilation to ensure it's part of the workspace
+                        var typeLocation = foundTypeSymbol.Locations.FirstOrDefault(l => l.IsInSource);
+                        if (typeLocation == null) {
+                            throw new McpException($"Type '{target}' has no source location");
+                        }
+
+                        var typeDocument = solution.GetDocument(typeLocation.SourceTree);
+                        if (typeDocument == null) {
+                            throw new McpException($"Could not find document for type '{target}'");
+                        }
+
+                        var typeSemanticModel = await typeDocument.GetSemanticModelAsync(cancellationToken);
+                        if (typeSemanticModel == null) {
+                            throw new McpException($"Could not get semantic model for type '{target}'");
+                        }
+
+                        var typeSyntaxNode = await typeLocation.SourceTree.GetRootAsync(cancellationToken);
+                        var typeNode = typeSyntaxNode.FindNode(typeLocation.SourceSpan);
+                        
+                        // Get the symbol from the current compilation
+                        var typeSymbol = typeSemanticModel.GetDeclaredSymbol(typeNode, cancellationToken) as INamedTypeSymbol;
+                        if (typeSymbol == null) {
+                            throw new McpException($"Could not resolve type '{target}' in the current compilation");
+                        }
+
+                        await complexityAnalysisService.AnalyzeTypeAsync(typeSymbol, metrics, recommendations, false, cancellationToken);
+                        break;
+
+                    case "project":
+                        // Find project by name
+                        var project = solution.Projects.FirstOrDefault(p => 
+                            string.Equals(p.Name, target, StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(Path.GetFileNameWithoutExtension(p.FilePath), target, StringComparison.OrdinalIgnoreCase));
+                        
+                        if (project == null) {
+                            throw new McpException($"Project '{target}' not found in the workspace");
+                        }
+
+                        await complexityAnalysisService.AnalyzeProjectAsync(project, metrics, recommendations, false, cancellationToken);
+                        break;
+                }
+
+                // Format the results nicely
+                return ToolHelpers.ToJson(new {
+                    scope,
+                    target,
+                    contextInfo = new {
+                        contextPath,
+                        contextType = contextType.ToString()
+                    },
+                    metrics,
+                    recommendations = recommendations.Distinct().OrderBy(r => r).ToList()
+                });
+            } finally {
+                workspace?.Dispose();
+            }
+        }, logger, nameof(AnalyzeComplexity_Stateless), cancellationToken);
+    }
+
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(ManageUsings_Stateless), Idempotent = true, ReadOnly = false, Destructive = true, OpenWorld = false)]
+    [Description("Stateless version of ManageUsings. Reads or writes using directives in a document. Works without a pre-loaded solution.")]
+    public static async Task<object> ManageUsings_Stateless(
+        StatelessWorkspaceFactory workspaceFactory,
+        ICodeModificationService modificationService,
+        ILogger<AnalysisToolsLogCategory> logger,
+        [Description("The absolute path to the file to manage usings in")] string filePath,
+        [Description("'read' or 'write'. For 'read', set codeToWrite to 'None'.")] string operation,
+        [Description("For 'read', must be 'None'. For 'write', provide all using directives that should exist in the file. This will replace all existing usings.")] string codeToWrite,
+        CancellationToken cancellationToken = default) {
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            // Validate parameters
+            ErrorHandlingHelpers.ValidateStringParameter(filePath, nameof(filePath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(operation, "operation", logger);
+            ErrorHandlingHelpers.ValidateFileExists(filePath, logger);
+
+            if (operation != "read" && operation != "write") {
+                throw new McpException($"Invalid operation '{operation}'. Must be 'read' or 'write'.");
+            }
+
+            if (operation == "read" && codeToWrite != "None") {
+                throw new McpException("For read operations, codeToWrite must be 'None'");
+            }
+
+            if (operation == "write" && (codeToWrite == "None" || string.IsNullOrEmpty(codeToWrite))) {
+                throw new McpException("For write operations, codeToWrite must contain the complete list of using directives");
+            }
+
+            logger.LogInformation("Executing '{ManageUsings_Stateless}' for file: {FilePath} (Operation: {Operation})",
+                nameof(ManageUsings_Stateless), filePath, operation);
+
+            var (workspace, project, document) = await workspaceFactory.CreateForFileAsync(filePath);
+            
+            try {
+                
+                if (document == null) {
+                    throw new McpException($"File '{filePath}' not found in the workspace");
+                }
+
+                var root = await document.GetSyntaxRootAsync(cancellationToken) ?? 
+                    throw new McpException($"Could not get syntax root for file '{filePath}'.");
+
+                // Find the global usings file for the project
+                var globalUsingsFile = project.Documents
+                    .FirstOrDefault(d => d.Name.Equals("GlobalUsings.cs", StringComparison.OrdinalIgnoreCase));
+
+                if (operation == "read") {
+                    var usingDirectives = root.DescendantNodes()
+                        .OfType<UsingDirectiveSyntax>()
+                        .Select(u => u.ToFullString().Trim())
+                        .ToList();
+
+                    // Handle global usings separately
+                    var globalUsings = new List<string>();
+                    if (globalUsingsFile != null) {
+                        var globalRoot = await globalUsingsFile.GetSyntaxRootAsync(cancellationToken);
+                        if (globalRoot != null) {
+                            globalUsings = globalRoot.DescendantNodes()
+                                .OfType<UsingDirectiveSyntax>()
+                                .Select(u => u.ToFullString().Trim())
+                                .ToList();
+                        }
+                    }
+
+                    return ToolHelpers.ToJson(new {
+                        file = filePath,
+                        usings = string.Join("\n", usingDirectives),
+                        globalUsings = string.Join("\n", globalUsings),
+                        contextInfo = new {
+                            contextType = "File",
+                            projectName = project.Name
+                        }
+                    });
+                }
+
+                // Write operation
+                bool isGlobalUsings = document.FilePath!.EndsWith("GlobalUsings.cs", StringComparison.OrdinalIgnoreCase);
+
+                // Parse and normalize directives
+                var directives = codeToWrite.Split('\n')
+                    .Select(line => line.Trim())
+                    .Where(line => !string.IsNullOrWhiteSpace(line))
+                    .Select(line => isGlobalUsings && !line.StartsWith("global ") ? $"global {line}" : line)
+                    .ToList();
+
+                // Create compilation unit with new directives
+                CompilationUnitSyntax? newRoot;
+                try {
+                    var tempCode = string.Join("\n", directives);
+                    newRoot = isGlobalUsings
+                        ? CSharpSyntaxTree.ParseText(tempCode).GetRoot() as CompilationUnitSyntax
+                        : ((CompilationUnitSyntax)root).WithUsings(SyntaxFactory.List(
+                            CSharpSyntaxTree.ParseText(tempCode + "\nnamespace N { class C { } }")
+                                .GetRoot()
+                                .DescendantNodes()
+                                .OfType<UsingDirectiveSyntax>()
+                        ));
+
+                    if (newRoot == null) {
+                        throw new FormatException("Failed to create valid syntax tree.");
+                    }
+                } catch (Exception ex) {
+                    throw new McpException($"Failed to parse using directives: {ex.Message}");
+                }
+
+                // Apply the changes using CodeModificationService
+                var newSolution = await modificationService.ReplaceNodeAsync(document.Id, root, newRoot, cancellationToken);
+                var formatted = await modificationService.FormatDocumentAsync(
+                    newSolution.GetDocument(document.Id)!, cancellationToken);
+                await modificationService.ApplyChangesAsync(formatted.Project.Solution, cancellationToken);
+
+                // Create diff for feedback
+                string diffResult = ContextInjectors.CreateCodeDiff(
+                    string.Join("", root.DescendantNodes().OfType<UsingDirectiveSyntax>().Select(u => u.ToFullString())),
+                    string.Join("", newRoot.DescendantNodes().OfType<UsingDirectiveSyntax>().Select(u => u.ToFullString())));
+
+                if (diffResult.Trim() == "// No changes detected.") {
+                    return "Using update was successful but no difference was detected.";
+                }
+
+                return "Successfully updated usings. Diff:\n" + diffResult;
+            } finally {
+                workspace?.Dispose();
+            }
+        }, logger, nameof(ManageUsings_Stateless), cancellationToken);
+    }
+
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(ManageAttributes_Stateless), Idempotent = true, ReadOnly = false, Destructive = true, OpenWorld = false)]
+    [Description("Stateless version of ManageAttributes. Reads or writes all attributes on a declaration. Works without a pre-loaded solution.")]
+    public static async Task<object> ManageAttributes_Stateless(
+        StatelessWorkspaceFactory workspaceFactory,
+        ICodeModificationService modificationService,
+        IFuzzyFqnLookupService fuzzyFqnLookupService,
+        ILogger<AnalysisToolsLogCategory> logger,
+        [Description("Path to a file, project, or solution containing the target.")] string contextPath,
+        [Description("'read' or 'write'. For 'read', set codeToWrite to 'None'.")] string operation,
+        [Description("For 'read', must be 'None'. For 'write', specify all attributes that should exist on the target declaration. This will replace all existing attributes.")] string codeToWrite,
+        [Description("The FQN of the target declaration to manage attributes for")] string targetDeclaration,
+        CancellationToken cancellationToken = default) {
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            // Validate parameters
+            ErrorHandlingHelpers.ValidateStringParameter(contextPath, nameof(contextPath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(operation, "operation", logger);
+            ErrorHandlingHelpers.ValidateStringParameter(targetDeclaration, "targetDeclaration", logger);
+
+            if (operation != "read" && operation != "write") {
+                throw new McpException($"Invalid operation '{operation}'. Must be 'read' or 'write'.");
+            }
+
+            if (operation == "read" && codeToWrite != "None") {
+                throw new McpException("For read operations, codeToWrite must be 'None'");
+            }
+
+            if (operation == "write" && codeToWrite == "None") {
+                throw new McpException("For write operations, codeToWrite must contain the attributes to set");
+            }
+
+            logger.LogInformation("Executing '{ManageAttributes_Stateless}' for: {TargetDeclaration} in context {ContextPath} (Operation: {Operation})",
+                nameof(ManageAttributes_Stateless), targetDeclaration, contextPath, operation);
+
+            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(contextPath);
+            
+            try {
+                Solution solution;
+                if (context is Solution sol) {
+                    solution = sol;
+                } else if (context is Project proj) {
+                    solution = proj.Solution;
+                } else {
+                    var dynamicContext = (dynamic)context;
+                    solution = ((Project)dynamicContext.Project).Solution;
+                }
+
+                // Use fuzzy lookup to find the symbol
+                var fuzzyMatches = await fuzzyFqnLookupService.FindMatchesAsync(targetDeclaration, new StatelessSolutionManager(solution), cancellationToken);
+                var bestMatch = fuzzyMatches.FirstOrDefault();
+                if (bestMatch == null) {
+                    throw new McpException($"Declaration '{targetDeclaration}' not found in the workspace");
+                }
+
+                var symbol = bestMatch.Symbol;
+                if (!symbol.DeclaringSyntaxReferences.Any()) {
+                    throw new McpException($"Symbol '{targetDeclaration}' has no declaring syntax references.");
+                }
+
+                var syntaxRef = symbol.DeclaringSyntaxReferences.First();
+                var node = await syntaxRef.GetSyntaxAsync(cancellationToken);
+
+                if (operation == "read") {
+                    // Get only the attributes on this node, not nested ones
+                    var attributeLists = node switch {
+                        MemberDeclarationSyntax mDecl => mDecl.AttributeLists,
+                        StatementSyntax stmt => stmt.AttributeLists,
+                        _ => SyntaxFactory.List<AttributeListSyntax>()
+                    };
+
+                    var attributes = string.Join("\n", attributeLists.Select(al => al.ToString().Trim()));
+                    var lineSpan = node.GetLocation().GetLineSpan();
+
+                    if (string.IsNullOrEmpty(attributes)) {
+                        attributes = "No attributes found.";
+                    }
+
+                    return ToolHelpers.ToJson(new {
+                        file = syntaxRef.SyntaxTree.FilePath,
+                        line = lineSpan.StartLinePosition.Line + 1,
+                        attributes,
+                        contextInfo = new {
+                            contextPath,
+                            contextType = contextType.ToString(),
+                            targetDeclaration
+                        }
+                    });
+                }
+
+                // Write operation
+                if (!(node is MemberDeclarationSyntax memberDecl)) {
+                    throw new McpException("Target declaration is not a valid member declaration.");
+                }
+
+                SyntaxList<AttributeListSyntax> newAttributeLists;
+                try {
+                    // Parse the attributes by wrapping in minimal valid syntax
+                    var tempCode = $"{(codeToWrite.Length == 0 ? "" : codeToWrite + "\n")}public class C {{ }}";
+                    newAttributeLists = CSharpSyntaxTree.ParseText(tempCode)
+                        .GetRoot()
+                        .DescendantNodes()
+                        .OfType<ClassDeclarationSyntax>()
+                        .First()
+                        .AttributeLists;
+                } catch (Exception ex) {
+                    throw new McpException($"Failed to parse attributes: {ex.Message}");
+                }
+
+                // Create updated declaration with new attributes
+                var newMember = memberDecl.WithAttributeLists(newAttributeLists);
+                var document = solution.GetDocument(syntaxRef.SyntaxTree)
+                    ?? throw new McpException("Could not find document for syntax tree.");
+
+                // Apply the changes
+                var newSolution = await modificationService.ReplaceNodeAsync(document.Id, memberDecl, newMember, cancellationToken);
+                var formatted = await modificationService.FormatDocumentAsync(
+                    newSolution.GetDocument(document.Id)!, cancellationToken);
+                await modificationService.ApplyChangesAsync(formatted.Project.Solution, cancellationToken);
+
+                // Return updated state to verify the change
+                string diffResult = ContextInjectors.CreateCodeDiff(
+                    memberDecl.AttributeLists.ToFullString(),
+                    newMember.AttributeLists.ToFullString());
+
+                if (diffResult.Trim() == "// No changes detected.") {
+                    return "Attribute update was successful but no difference was detected.";
+                }
+
+                return "Successfully updated attributes. Diff:\n" + diffResult;
+            } finally {
+                workspace?.Dispose();
+            }
+        }, logger, nameof(ManageAttributes_Stateless), cancellationToken);
     }
 
     #endregion

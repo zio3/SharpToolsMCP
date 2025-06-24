@@ -83,7 +83,7 @@ class CompareSearchDefinitions
             {
                 Console.WriteLine("   Loading solution...");
                 var loadStopwatch = Stopwatch.StartNew();
-                await solutionManager.LoadSolutionAsync(solutionPath);
+                await solutionManager.LoadSolutionAsync(solutionPath, default);
                 loadStopwatch.Stop();
                 Console.WriteLine($"   Solution loaded in: {loadStopwatch.ElapsedMilliseconds}ms");
             }
