@@ -3,6 +3,7 @@ using DiffPlex.DiffBuilder.Model;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using ModelContextProtocol;
 using SharpTools.Tools.Services;
+using System.Reflection;
 using System.Text.Json;
 
 namespace SharpTools.Tools.Mcp.Tools;
@@ -2216,6 +2217,447 @@ public static partial class AnalysisTools {
                 workspace?.Dispose();
             }
         }, logger, nameof(ListImplementations_Stateless), cancellationToken);
+    }
+
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(SearchDefinitions_Stateless), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
+    [Description("Stateless version of SearchDefinitions. Dual-engine pattern search across source code AND compiled assemblies for public APIs. Works without a pre-loaded solution, using the provided context path.")]
+    public static async Task<object> SearchDefinitions_Stateless(
+        StatelessWorkspaceFactory workspaceFactory,
+        ProjectDiscoveryService projectDiscovery,
+        ILogger<AnalysisToolsLogCategory> logger,
+        [Description("Path to a file, project, solution, or directory to use as search context.")] string contextPath,
+        [Description("The regex pattern to match against full declaration text (multiline) and symbol names.")] string regexPattern,
+        CancellationToken cancellationToken) {
+
+        // Maximum number of search results to return
+        const int MaxSearchResults = 20;
+        // Limits for reflection search in stateless mode
+        const int MaxProjectsForReflection = 5;
+        const int MaxReferencesForReflection = 10;
+
+        static bool IsGeneratedCode(string signature) {
+            return signature.Contains("+<")                  // Generated closures
+                || signature.Contains("<>")                  // Generated closures and async state machines
+                || signature.Contains("+d__")               // Async state machines
+                || signature.Contains("__Generated")        // Generated code marker
+                || signature.Contains("<Clone>")            // Generated clone methods
+                || signature.Contains("<BackingField>")     // Generated backing fields
+                || signature.Contains(".+")                 // Generated nested types
+                || signature.Contains("$")                  // Generated interop types
+                || signature.Contains("__Backing__")        // Generated backing fields
+                || (signature.Contains("_") && signature.Contains("<"))  // Generated async methods
+                || (signature.Contains("+") && signature.Contains("`")); // Generic factory-created types
+        }
+
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            ErrorHandlingHelpers.ValidateStringParameter(contextPath, "contextPath", logger);
+            ErrorHandlingHelpers.ValidateStringParameter(regexPattern, "regexPattern", logger);
+
+            logger.LogInformation("Executing '{SearchDefinitions_Stateless}' with pattern: {RegexPattern} in context: {ContextPath}",
+                nameof(SearchDefinitions_Stateless), regexPattern, contextPath);
+
+            Regex regex;
+            try {
+                regex = new Regex(regexPattern, RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Multiline);
+            } catch (ArgumentException ex) {
+                throw new McpException($"Invalid regular expression pattern: {ex.Message}");
+            }
+
+            var matches = new ConcurrentBag<dynamic>();
+            bool hasPartialResults = false;
+            var errors = new ConcurrentBag<string>();
+            int projectsProcessed = 0;
+            int projectsSkipped = 0;
+            var matchedNodeSpans = new ConcurrentDictionary<string, HashSet<TextSpan>>();
+            int totalMatchesFound = 0;
+
+            // Create workspace based on context
+            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(contextPath);
+            
+            try {
+                Solution solution;
+                List<Project> projectsToSearch;
+
+                if (context is Solution sol) {
+                    solution = sol;
+                    projectsToSearch = solution.Projects.ToList();
+                } else if (context is Project proj) {
+                    solution = proj.Solution;
+                    projectsToSearch = new List<Project> { proj };
+                } else {
+                    // Context is (Document document, Project project)
+                    var dynamicContext = (dynamic)context;
+                    var project = (Project)dynamicContext.Project;
+                    solution = project.Solution;
+                    projectsToSearch = new List<Project> { project };
+                }
+
+                // Source code search (reusing logic from stateful version)
+                try {
+                    var projectTasks = projectsToSearch.Select(project => Task.Run(async () => {
+                        try {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            var compilation = await project.GetCompilationAsync(cancellationToken);
+                            if (compilation == null) {
+                                Interlocked.Increment(ref projectsSkipped);
+                                logger.LogWarning("Skipping project {ProjectName}, compilation is null", project.Name);
+                                return;
+                            }
+
+                            foreach (var syntaxTree in compilation.SyntaxTrees) {
+                                try {
+                                    // Check if we've already exceeded the result limit
+                                    if (Interlocked.CompareExchange(ref totalMatchesFound, 0, 0) >= MaxSearchResults) {
+                                        hasPartialResults = true;
+                                        break;
+                                    }
+
+                                    cancellationToken.ThrowIfCancellationRequested();
+                                    var semanticModel = compilation.GetSemanticModel(syntaxTree);
+                                    var sourceText = await syntaxTree.GetTextAsync(cancellationToken);
+                                    string filePath = syntaxTree.FilePath ?? "unknown file";
+
+                                    var root = await syntaxTree.GetRootAsync(cancellationToken);
+                                    var matchedNodesInFile = new Dictionary<SyntaxNode, List<Match>>();
+
+                                    // First pass: Find all nodes with regex matches
+                                    foreach (var node in root.DescendantNodes()
+                                        .Where(n => n is MemberDeclarationSyntax or VariableDeclaratorSyntax)) {
+                                        cancellationToken.ThrowIfCancellationRequested();
+
+                                        // Check if we've already exceeded the result limit
+                                        if (Interlocked.CompareExchange(ref totalMatchesFound, 0, 0) >= MaxSearchResults) {
+                                            hasPartialResults = true;
+                                            break;
+                                        }
+
+                                        try {
+                                            string declText = node.ToString();
+                                            var declMatches = regex.Matches(declText);
+                                            if (declMatches.Count > 0) {
+                                                matchedNodesInFile.Add(node, declMatches.Cast<Match>().ToList());
+                                                if (!matchedNodeSpans.TryGetValue(filePath, out var spans)) {
+                                                    spans = new HashSet<TextSpan>();
+                                                    matchedNodeSpans[filePath] = spans;
+                                                }
+                                                spans.Add(node.Span);
+                                            }
+                                        } catch (Exception ex) when (!(ex is OperationCanceledException)) {
+                                            logger.LogTrace(ex, "Error examining node in {FilePath}", filePath);
+                                            hasPartialResults = true;
+                                        }
+                                    }
+
+                                    // Second pass: Process only nodes that don't have a matched child
+                                    foreach (var (node, nodeMatches) in matchedNodesInFile) {
+                                        // Check if we've already exceeded the result limit
+                                        if (Interlocked.CompareExchange(ref totalMatchesFound, 0, 0) >= MaxSearchResults) {
+                                            hasPartialResults = true;
+                                            break;
+                                        }
+
+                                        try {
+                                            if (matchedNodeSpans.TryGetValue(filePath, out var spans) &&
+                                                node.DescendantNodes().Any(child => spans.Contains(child.Span) && child != node)) {
+                                                continue;
+                                            }
+
+                                            ISymbol? symbol = node switch {
+                                                MemberDeclarationSyntax mds => semanticModel.GetDeclaredSymbol(mds, cancellationToken),
+                                                VariableDeclaratorSyntax vds => semanticModel.GetDeclaredSymbol(vds, cancellationToken),
+                                                _ => null
+                                            };
+
+                                            if (symbol != null) {
+                                                var signature = symbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+                                                if (IsGeneratedCode(signature)) {
+                                                    continue;
+                                                }
+
+                                                // Get containing type
+                                                var containingType = symbol.ContainingType;
+                                                var containingSymbol = symbol.ContainingSymbol;
+                                                string parentFqn;
+
+                                                if (containingType != null) {
+                                                    // For members inside a type
+                                                    parentFqn = FuzzyFqnLookupService.GetSearchableString(containingType);
+                                                    if (IsGeneratedCode(parentFqn)) continue;
+                                                } else if (containingSymbol != null && containingSymbol.Kind == SymbolKind.Namespace) {
+                                                    // For top-level types in a namespace
+                                                    parentFqn = FuzzyFqnLookupService.GetSearchableString(containingSymbol);
+                                                } else {
+                                                    // Fallback for other cases
+                                                    parentFqn = "global";
+                                                }
+
+                                                // Process each match in the declaration
+                                                foreach (Match match in nodeMatches) {
+                                                    // Check if we've already exceeded the result limit
+                                                    if (Interlocked.CompareExchange(ref totalMatchesFound, 0, 0) >= MaxSearchResults) {
+                                                        hasPartialResults = true;
+                                                        break;
+                                                    }
+
+                                                    int matchStartPos = node.SpanStart + match.Index;
+                                                    var matchLinePos = sourceText.Lines.GetLinePosition(matchStartPos);
+                                                    int matchLineNumber = matchLinePos.Line + 1;
+                                                    var matchLine = sourceText.Lines[matchLinePos.Line].ToString().Trim();
+
+                                                    if (Interlocked.Increment(ref totalMatchesFound) <= MaxSearchResults) {
+                                                        matches.Add(new {
+                                                            kind = ToolHelpers.GetSymbolKindString(symbol),
+                                                            parentFqn = parentFqn,
+                                                            signature = signature,
+                                                            match = matchLine,
+                                                            location = new {
+                                                                filePath,
+                                                                line = matchLineNumber
+                                                            }
+                                                        });
+                                                    } else {
+                                                        hasPartialResults = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        } catch (Exception ex) when (!(ex is OperationCanceledException)) {
+                                            logger.LogTrace(ex, "Error processing syntax node in {FilePath}", filePath);
+                                            hasPartialResults = true;
+                                        }
+                                    }
+                                } catch (Exception ex) when (!(ex is OperationCanceledException)) {
+                                    logger.LogWarning(ex, "Error processing syntax tree {FilePath}",
+                                        syntaxTree.FilePath ?? "unknown file");
+                                    hasPartialResults = true;
+                                }
+                            }
+
+                            Interlocked.Increment(ref projectsProcessed);
+                        } catch (Exception ex) when (!(ex is OperationCanceledException)) {
+                            Interlocked.Increment(ref projectsSkipped);
+                            logger.LogWarning(ex, "Error processing project {ProjectName}", project.Name);
+                            hasPartialResults = true;
+                            errors.Add($"Error in project {project.Name}: {ex.Message}");
+                        }
+                    }, cancellationToken));
+
+                    await Task.WhenAll(projectTasks);
+                } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
+                    logger.LogError(ex, "Error searching Roslyn symbols with pattern {Pattern}", regexPattern);
+                    hasPartialResults = true;
+                    errors.Add($"Error searching source code symbols: {ex.Message}");
+                }
+
+                // Limited reflection search for stateless mode
+                var reflectionSearchTask = Task.Run(async () => {
+                    try {
+                        // If already at limit, skip reflection search
+                        if (Interlocked.CompareExchange(ref totalMatchesFound, 0, 0) >= MaxSearchResults) {
+                            hasPartialResults = true;
+                            return;
+                        }
+
+                        // Limit the number of projects to search
+                        var projectsForReflection = projectsToSearch.Take(MaxProjectsForReflection).ToList();
+                        var referencedAssemblies = new HashSet<string>();
+
+                        // Collect unique assembly references from projects
+                        foreach (var project in projectsForReflection) {
+                            var compilation = await project.GetCompilationAsync(cancellationToken);
+                            if (compilation != null) {
+                                foreach (var reference in compilation.References.Take(MaxReferencesForReflection)) {
+                                    if (reference is Microsoft.CodeAnalysis.PortableExecutableReference peRef && !string.IsNullOrEmpty(peRef.FilePath)) {
+                                        referencedAssemblies.Add(peRef.FilePath);
+                                    }
+                                }
+                            }
+                        }
+
+                        //help in common case where it is looking for a class definition, but reflections don't have the 'class' keyword
+                        string reflectionPattern = ClassRegex().Replace(regexPattern, string.Empty);
+                        var reflectionRegex = new Regex(reflectionPattern,
+                            RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.NonBacktracking);
+
+                        // Load and search types from referenced assemblies
+                        foreach (var assemblyPath in referencedAssemblies.Take(MaxReferencesForReflection)) {
+                            if (cancellationToken.IsCancellationRequested) break;
+                            if (Interlocked.CompareExchange(ref totalMatchesFound, 0, 0) >= MaxSearchResults) {
+                                hasPartialResults = true;
+                                break;
+                            }
+
+                            try {
+                                var assembly = Assembly.LoadFrom(assemblyPath);
+                                var types = assembly.GetTypes();
+
+                                foreach (var type in types) {
+                                    if (cancellationToken.IsCancellationRequested) break;
+                                    if (Interlocked.CompareExchange(ref totalMatchesFound, 0, 0) >= MaxSearchResults) {
+                                        hasPartialResults = true;
+                                        break;
+                                    }
+
+                                    try {
+                                        if (IsGeneratedCode(type.FullName ?? type.Name)) {
+                                            continue;
+                                        }
+
+                                        bool hasMatchedMembers = false;
+                                        var matchedMembers = new List<(string name, object match)>();
+
+                                        var bindingFlags = BindingFlags.Public | BindingFlags.Instance |
+                                            BindingFlags.Static | BindingFlags.DeclaredOnly;
+                                        foreach (var memberInfo in type.GetMembers(bindingFlags)) {
+                                            if (cancellationToken.IsCancellationRequested) break;
+                                            if (Interlocked.CompareExchange(ref totalMatchesFound, 0, 0) >= MaxSearchResults) {
+                                                hasPartialResults = true;
+                                                break;
+                                            }
+
+                                            if (memberInfo is MethodInfo mi && mi.IsSpecialName &&
+                                                (mi.Name.StartsWith("get_") || mi.Name.StartsWith("set_") ||
+                                                mi.Name.StartsWith("add_") || mi.Name.StartsWith("remove_"))) {
+                                                continue;
+                                            }
+
+                                            if (reflectionRegex.IsMatch(memberInfo.ToString() ?? memberInfo.Name)) {
+                                                string signature = memberInfo.ToString()!;
+                                                if (IsGeneratedCode(signature)) {
+                                                    continue;
+                                                }
+
+                                                hasMatchedMembers = true;
+                                                if (memberInfo is MethodInfo method) {
+                                                    var parameters = string.Join(", ",
+                                                        method.GetParameters().Select(p => p.ParameterType.Name));
+                                                    signature = $"{type.FullName}.{memberInfo.Name}({parameters})";
+                                                }
+
+                                                var assemblyLocation = type.Assembly.Location;
+
+                                                if (Interlocked.Increment(ref totalMatchesFound) <= MaxSearchResults) {
+                                                    matches.Add(new {
+                                                        kind = ToolHelpers.GetReflectionMemberTypeKindString(memberInfo),
+                                                        parentFqn = type.FullName ?? type.Name,
+                                                        signature = signature,
+                                                        match = memberInfo.Name,
+                                                        location = new {
+                                                            filePath = assemblyLocation,
+                                                            line = 0 // No line numbers for reflection matches
+                                                        }
+                                                    });
+                                                } else {
+                                                    hasPartialResults = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        if (reflectionRegex.IsMatch(type.FullName ?? type.Name) && !hasMatchedMembers) {
+                                            if (Interlocked.CompareExchange(ref totalMatchesFound, 0, 0) >= MaxSearchResults) {
+                                                hasPartialResults = true;
+                                                break;
+                                            }
+
+                                            var assemblyLocation = type.Assembly.Location;
+
+                                            if (Interlocked.Increment(ref totalMatchesFound) <= MaxSearchResults) {
+                                                matches.Add(new {
+                                                    kind = ToolHelpers.GetReflectionTypeKindString(type),
+                                                    parentFqn = type.Namespace ?? "global",
+                                                    signature = type.FullName ?? type.Name,
+                                                    match = type.FullName ?? type.Name,
+                                                    location = new {
+                                                        filePath = assemblyLocation,
+                                                        line = 0 // No line numbers for reflection matches
+                                                    }
+                                                });
+                                            } else {
+                                                hasPartialResults = true;
+                                                break;
+                                            }
+                                        }
+                                    } catch (Exception ex) when (!(ex is OperationCanceledException)) {
+                                        logger.LogTrace(ex, "Error processing reflection type {TypeName}",
+                                            type.FullName ?? type.Name);
+                                        hasPartialResults = true;
+                                    }
+                                }
+                            } catch (Exception ex) when (!(ex is OperationCanceledException)) {
+                                logger.LogTrace(ex, "Error loading assembly {AssemblyPath}", assemblyPath);
+                                // Continue with next assembly
+                            }
+                        }
+                    } catch (Exception ex) when (!(ex is OperationCanceledException)) {
+                        logger.LogError(ex, "Error searching reflection members with pattern {Pattern}", regexPattern);
+                        hasPartialResults = true;
+                        errors.Add($"Error searching reflection members: {ex.Message}");
+                    }
+                }, cancellationToken);
+
+                try {
+                    await Task.WhenAny(reflectionSearchTask, Task.Delay(TimeSpan.FromSeconds(5), cancellationToken));
+                    if (!reflectionSearchTask.IsCompleted) {
+                        logger.LogWarning("Reflection search timed out after 5 seconds. Returning partial results.");
+                        hasPartialResults = true;
+                        errors.Add("Reflection search timed out after 5 seconds, returning partial results.");
+                    } else if (reflectionSearchTask.IsFaulted && reflectionSearchTask.Exception != null) {
+                        throw reflectionSearchTask.Exception.InnerException ?? reflectionSearchTask.Exception;
+                    }
+                } catch (OperationCanceledException) {
+                    throw;
+                }
+
+                // Group matches first by file, then by parent type/namespace, then by kind
+                var groupedMatches = matches
+                    .OrderBy(m => ((dynamic)m).location.filePath)
+                    .ThenBy(m => ((dynamic)m).parentFqn)
+                    .ThenBy(m => ((dynamic)m).kind)
+                    .GroupBy(m => ((dynamic)m).location.filePath)
+                    .ToDictionary(
+                        g => g.Key,
+                        g => g.GroupBy(m => ((dynamic)m).parentFqn)
+                            .ToDictionary(
+                                pg => ToolHelpers.RemoveGlobalPrefix(pg.Key),
+                                pg => pg.GroupBy(m => ((dynamic)m).kind)
+                                    .ToDictionary(
+                                        kg => kg.Key,
+                                        kg => kg
+                                            .Where(m => !IsGeneratedCode(((dynamic)m).match))
+                                            .DistinctBy(m => ((dynamic)m).match)
+                                            .Select(m => new {
+                                                match = ((dynamic)m).match,
+                                                line = ((dynamic)m).location.line > 0 ? ((dynamic)m).location.line : null,
+                                            }).OrderBy(m => m.line).ToList()
+                                    )
+                            )
+                    );
+
+                // Prepare a message for omitted results if we hit the limit
+                string? resultsLimitMessage = null;
+                if (hasPartialResults) {
+                    resultsLimitMessage = $"Some search results omitted for brevity, try narrowing your search if you didn't find what you needed.";
+                    logger.LogInformation("Search results limited");
+                }
+
+                return ToolHelpers.ToJson(new {
+                    pattern = regexPattern,
+                    matchesByFile = groupedMatches,
+                    resultsLimitMessage,
+                    errors = errors.Any() ? errors.ToList() : null,
+                    totalMatchesFound,
+                    contextInfo = new {
+                        contextPath,
+                        contextType = contextType.ToString(),
+                        projectsSearched = projectsProcessed,
+                        reflectionLimited = $"Limited to {MaxProjectsForReflection} projects and {MaxReferencesForReflection} references"
+                    }
+                });
+            } finally {
+                workspace?.Dispose();
+            }
+        }, logger, nameof(SearchDefinitions_Stateless), cancellationToken);
     }
 
     #endregion
