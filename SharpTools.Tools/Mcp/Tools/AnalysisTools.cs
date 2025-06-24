@@ -1,5 +1,6 @@
 using DiffPlex.DiffBuilder;
 using DiffPlex.DiffBuilder.Model;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using ModelContextProtocol;
 using SharpTools.Tools.Services;
 using System.Text.Json;
@@ -1799,6 +1800,425 @@ public static partial class AnalysisTools {
 
         }, logger, nameof(FindPotentialDuplicates), cancellationToken);
     }
+
+    #region Stateless Methods
+
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(GetMembers_Stateless), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
+    [Description("Stateless version of GetMembers. Lists the full signatures of members of a specified type, including XML documentation. Works without a pre-loaded solution.")]
+    public static async Task<object> GetMembers_Stateless(
+        StatelessWorkspaceFactory workspaceFactory,
+        ICodeAnalysisService codeAnalysisService,
+        IFuzzyFqnLookupService fuzzyFqnLookupService,
+        ILogger<AnalysisToolsLogCategory> logger,
+        [Description("Path to a file, project, or solution containing the target type.")] string contextPath,
+        [Description("The fully qualified name of the type.")] string fullyQualifiedTypeName,
+        [Description("If true, includes private members; otherwise, only public/internal/protected members.")] bool includePrivateMembers,
+        CancellationToken cancellationToken = default) {
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            ErrorHandlingHelpers.ValidateStringParameter(contextPath, nameof(contextPath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedTypeName, nameof(fullyQualifiedTypeName), logger);
+            
+            logger.LogInformation("Executing '{GetMembers_Stateless}' for: {TypeName} in context {ContextPath} (IncludePrivate: {IncludePrivate})",
+                nameof(GetMembers_Stateless), fullyQualifiedTypeName, contextPath, includePrivateMembers);
+
+            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(contextPath);
+            
+            try {
+                Solution solution;
+                if (context is Solution sol) {
+                    solution = sol;
+                } else if (context is Project proj) {
+                    solution = proj.Solution;
+                } else {
+                    var dynamicContext = (dynamic)context;
+                    solution = ((Project)dynamicContext.Project).Solution;
+                }
+
+                // Use fuzzy lookup to find the symbol
+                var fuzzyMatches = await fuzzyFqnLookupService.FindMatchesAsync(fullyQualifiedTypeName, new StatelessSolutionManager(solution), cancellationToken);
+                var bestMatch = fuzzyMatches.FirstOrDefault();
+                if (bestMatch == null || !(bestMatch.Symbol is INamedTypeSymbol namedTypeSymbol)) {
+                    throw new McpException($"Type '{fullyQualifiedTypeName}' not found in the workspace");
+                }
+
+                string typeName = ToolHelpers.RemoveGlobalPrefix(namedTypeSymbol.ToDisplayString(ToolHelpers.FullyQualifiedFormatWithoutGlobal));
+                var membersByLocation = new Dictionary<string, Dictionary<string, List<string>>>();
+                var defaultLocation = "Unknown Location";
+
+                foreach (var member in namedTypeSymbol.GetMembers()) {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    if (member.IsImplicitlyDeclared || ToolHelpers.IsPropertyAccessor(member)) {
+                        continue;
+                    }
+
+                    bool shouldInclude = includePrivateMembers ||
+                                         member.DeclaredAccessibility == Accessibility.Public ||
+                                         member.DeclaredAccessibility == Accessibility.Internal ||
+                                         member.DeclaredAccessibility == Accessibility.Protected ||
+                                         member.DeclaredAccessibility == Accessibility.ProtectedAndInternal ||
+                                         member.DeclaredAccessibility == Accessibility.ProtectedOrInternal;
+
+                    if (shouldInclude) {
+                        try {
+                            var locationInfo = GetDeclarationLocationInfo(member);
+                            var location = locationInfo.FirstOrDefault();
+                            var locationKey = location != null
+                                ? location.FilePath
+                                : defaultLocation;
+
+                            var kind = ToolHelpers.GetSymbolKindString(member);
+                            string xmlDocs = await codeAnalysisService.GetXmlDocumentationAsync(member, cancellationToken) ?? string.Empty;
+                            string signature = ToolHelpers.GetRoslynSymbolModifiersString(member)
+                                               + " " + (CodeAnalysisService.GetFormattedSignatureAsync(member, false)).Replace(typeName + ".", string.Empty).Trim()
+                                               + (!string.IsNullOrEmpty(xmlDocs) ? $" // {xmlDocs.Replace("\n", " ").Replace("\r", "")}" : "");
+
+                            if (!membersByLocation.ContainsKey(locationKey)) {
+                                membersByLocation[locationKey] = new Dictionary<string, List<string>>();
+                            }
+
+                            if (!membersByLocation[locationKey].ContainsKey(kind)) {
+                                membersByLocation[locationKey][kind] = new List<string>();
+                            }
+
+                            membersByLocation[locationKey][kind].Add(signature);
+                        } catch (Exception ex) {
+                            logger.LogWarning(ex, "Error processing member {MemberName} in {TypeName}", member.Name, fullyQualifiedTypeName);
+                        }
+                    }
+                }
+
+                var typeLocations = GetDeclarationLocationInfo(namedTypeSymbol);
+                return ToolHelpers.ToJson(new {
+                    kind = ToolHelpers.GetSymbolKindString(namedTypeSymbol),
+                    signature = ToolHelpers.GetRoslynSymbolModifiersString(namedTypeSymbol) + " " + namedTypeSymbol.ToDisplayString(ToolHelpers.FullyQualifiedFormatWithoutGlobal),
+                    xmlDocs = await codeAnalysisService.GetXmlDocumentationAsync(namedTypeSymbol, cancellationToken) ?? string.Empty,
+                    note = $"Use {ToolHelpers.SharpToolPrefix}{nameof(ViewDefinition_Stateless)} to view the full source code of the types or members.",
+                    locations = typeLocations,
+                    includesPrivateMembers = includePrivateMembers,
+                    membersByLocation = membersByLocation
+                });
+            } finally {
+                workspace?.Dispose();
+            }
+        }, logger, nameof(GetMembers_Stateless), cancellationToken);
+    }
+
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(ViewDefinition_Stateless), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
+    [Description("Stateless version of ViewDefinition. Displays the verbatim source code from the declaration of a target symbol. Works without a pre-loaded solution.")]
+    public static async Task<string> ViewDefinition_Stateless(
+        StatelessWorkspaceFactory workspaceFactory,
+        ICodeAnalysisService codeAnalysisService,
+        ISourceResolutionService sourceResolutionService,
+        IFuzzyFqnLookupService fuzzyFqnLookupService,
+        ILogger<AnalysisToolsLogCategory> logger,
+        [Description("Path to a file, project, or solution containing the target symbol.")] string contextPath,
+        [Description("The fully qualified name of the symbol (type, method, property, etc.).")] string fullyQualifiedSymbolName,
+        CancellationToken cancellationToken) {
+
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            ErrorHandlingHelpers.ValidateStringParameter(contextPath, nameof(contextPath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedSymbolName, "fullyQualifiedSymbolName", logger);
+
+            logger.LogInformation("Executing '{ViewDefinition_Stateless}' for: {SymbolName} in context {ContextPath}", 
+                nameof(ViewDefinition_Stateless), fullyQualifiedSymbolName, contextPath);
+
+            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(contextPath);
+            
+            try {
+                Solution solution;
+                if (context is Solution sol) {
+                    solution = sol;
+                } else if (context is Project proj) {
+                    solution = proj.Solution;
+                } else {
+                    var dynamicContext = (dynamic)context;
+                    solution = ((Project)dynamicContext.Project).Solution;
+                }
+
+                // Use fuzzy lookup to find the symbol
+                var fuzzyMatches = await fuzzyFqnLookupService.FindMatchesAsync(fullyQualifiedSymbolName, new StatelessSolutionManager(solution), cancellationToken);
+                var bestMatch = fuzzyMatches.FirstOrDefault();
+                if (bestMatch == null) {
+                    throw new McpException($"Symbol '{fullyQualifiedSymbolName}' not found in the workspace");
+                }
+                var roslynSymbol = bestMatch.Symbol;
+
+                var locations = roslynSymbol.Locations.Where(l => l.IsInSource).ToList();
+
+                if (!locations.Any()) {
+                    // No source locations found in the solution, try to resolve from external sources
+                    logger.LogInformation("No source locations found for '{SymbolName}' in the current solution, attempting external source resolution", fullyQualifiedSymbolName);
+
+                    var sourceResult = await sourceResolutionService.ResolveSourceAsync(roslynSymbol, cancellationToken);
+                    if (sourceResult != null) {
+                        // Add relevant reference context based on the symbol type
+                        var externalReferenceContext = roslynSymbol switch {
+                            Microsoft.CodeAnalysis.INamedTypeSymbol type => await ContextInjectors.CreateTypeReferenceContextAsync(codeAnalysisService, logger, type, cancellationToken),
+                            Microsoft.CodeAnalysis.IMethodSymbol method => await ContextInjectors.CreateCallGraphContextAsync(codeAnalysisService, logger, method, cancellationToken),
+                            _ => string.Empty
+                        };
+
+                        // Remove leading whitespace from each line of the resolved source
+                        var sourceLines = sourceResult.Source.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+                        for (int i = 0; i < sourceLines.Length; i++) {
+                            sourceLines[i] = TrimLeadingWhitespace(sourceLines[i]);
+                        }
+                        var formattedSource = string.Join(Environment.NewLine, sourceLines);
+
+                        return $"<definition>\n<referencingTypes>\n{externalReferenceContext}\n</referencingTypes>\n<code file='{sourceResult.FilePath}' source='External - {sourceResult.ResolutionMethod}'>\n{formattedSource}\n</code>\n</definition>";
+                    }
+
+                    throw new McpException($"No source definition found for '{fullyQualifiedSymbolName}'. The symbol might be defined in metadata (compiled assembly) only and couldn't be decompiled.");
+                }
+
+                // Check if this is a partial type with multiple declarations
+                var isPartialType = roslynSymbol is Microsoft.CodeAnalysis.INamedTypeSymbol namedTypeSymbol &&
+                                   roslynSymbol.DeclaringSyntaxReferences.Count() > 1;
+
+                if (isPartialType) {
+                    // Handle partial types by collecting all partial declarations
+                    return await HandlePartialTypeDefinitionAsync(roslynSymbol, solution, codeAnalysisService, logger, cancellationToken);
+                } else {
+                    // Handle single declaration (non-partial or single-part symbols)
+                    return await HandleSingleDefinitionAsync(roslynSymbol, solution, locations.First(), codeAnalysisService, logger, cancellationToken);
+                }
+            } finally {
+                workspace?.Dispose();
+            }
+        }, logger, nameof(ViewDefinition_Stateless), cancellationToken);
+    }
+
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(FindReferences_Stateless), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
+    [Description("Stateless version of FindReferences. Finds all references to a specified symbol with surrounding context. Works without a pre-loaded solution.")]
+    public static async Task<object> FindReferences_Stateless(
+        StatelessWorkspaceFactory workspaceFactory,
+        ICodeAnalysisService codeAnalysisService,
+        IFuzzyFqnLookupService fuzzyFqnLookupService,
+        ILogger<AnalysisToolsLogCategory> logger,
+        [Description("Path to a file, project, or solution to search for references in.")] string contextPath,
+        [Description("The FQN of the symbol.")] string fullyQualifiedSymbolName,
+        CancellationToken cancellationToken) {
+
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            ErrorHandlingHelpers.ValidateStringParameter(contextPath, nameof(contextPath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedSymbolName, "fullyQualifiedSymbolName", logger);
+
+            logger.LogInformation("Executing '{FindReferences_Stateless}' for: {SymbolName} in context {ContextPath}",
+                nameof(FindReferences_Stateless), fullyQualifiedSymbolName, contextPath);
+
+            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(contextPath);
+            
+            try {
+                Solution solution;
+                if (context is Solution sol) {
+                    solution = sol;
+                } else if (context is Project proj) {
+                    solution = proj.Solution;
+                } else {
+                    var dynamicContext = (dynamic)context;
+                    solution = ((Project)dynamicContext.Project).Solution;
+                }
+
+                // Use fuzzy lookup to find the symbol
+                var fuzzyMatches = await fuzzyFqnLookupService.FindMatchesAsync(fullyQualifiedSymbolName, new StatelessSolutionManager(solution), cancellationToken);
+                var bestMatch = fuzzyMatches.FirstOrDefault();
+                if (bestMatch == null) {
+                    throw new McpException($"Symbol '{fullyQualifiedSymbolName}' not found in the workspace");
+                }
+                var symbol = bestMatch.Symbol;
+
+                // Use SymbolFinder directly with the stateless solution
+                var referencedSymbols = await SymbolFinder.FindReferencesAsync(symbol, solution, cancellationToken: cancellationToken);
+
+                var references = new List<object>();
+                var maxToShow = 20;
+                int count = 0;
+
+                try {
+                    foreach (var refGroup in referencedSymbols) {
+                        foreach (var location in refGroup.Locations) {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            if (count >= maxToShow) break;
+
+                            if (location.Document != null && location.Location.IsInSource) {
+                                try {
+                                    var sourceTree = location.Location.SourceTree;
+                                    if (sourceTree == null) {
+                                        logger.LogWarning("Null source tree for reference location in {FilePath}",
+                                            location.Document.FilePath ?? "unknown file");
+                                        continue;
+                                    }
+
+                                    var sourceText = await sourceTree.GetTextAsync(cancellationToken);
+                                    var lineSpan = location.Location.GetLineSpan();
+
+                                    var contextLines = new List<string>();
+                                    const int linesAround = 2;
+                                    for (int i = Math.Max(0, lineSpan.StartLinePosition.Line - linesAround);
+                                         i <= Math.Min(sourceText.Lines.Count - 1, lineSpan.EndLinePosition.Line + linesAround);
+                                         i++) {
+                                        contextLines.Add(TrimLeadingWhitespace(sourceText.Lines[i].ToString()));
+                                    }
+
+                                    string parentMember = "N/A";
+                                    try {
+                                        var syntaxRoot = await sourceTree.GetRootAsync(cancellationToken);
+                                        var token = syntaxRoot.FindToken(location.Location.SourceSpan.Start);
+
+                                        if (token.Parent != null) {
+                                            var memberDecl = token.Parent
+                                                .AncestorsAndSelf()
+                                                .OfType<MemberDeclarationSyntax>()
+                                                .FirstOrDefault();
+
+                                            if (memberDecl != null) {
+                                                var semanticModel = await location.Document.GetSemanticModelAsync(cancellationToken);
+                                                var parentSymbol = semanticModel?.GetDeclaredSymbol(memberDecl, cancellationToken);
+                                                if (parentSymbol != null) {
+                                                    parentMember = CodeAnalysisService.GetFormattedSignatureAsync(parentSymbol, false) +
+                                                        $" //FQN: {FuzzyFqnLookupService.GetSearchableString(parentSymbol)}";
+                                                }
+                                            }
+                                        }
+                                    } catch (Exception ex) {
+                                        logger.LogWarning(ex, "Error getting parent member for reference in {FilePath}",
+                                            location.Document.FilePath ?? "unknown file");
+                                    }
+
+                                    references.Add(new {
+                                        filePath = location.Document.FilePath,
+                                        startLine = lineSpan.StartLinePosition.Line + 1,
+                                        endLine = lineSpan.EndLinePosition.Line + 1,
+                                        parentMember,
+                                        context = string.Join(Environment.NewLine, contextLines),
+                                        note = "Indentation is omitted to save tokens."
+                                    });
+
+                                    count++;
+                                } catch (Exception ex) {
+                                    logger.LogWarning(ex, "Error processing reference location in {FilePath}",
+                                        location.Document?.FilePath ?? "unknown file");
+                                }
+                            }
+                        }
+                        if (count >= maxToShow) break;
+                    }
+                } catch (Exception ex) {
+                    logger.LogWarning(ex, "Error during reference search for {SymbolName}", fullyQualifiedSymbolName);
+                }
+
+                return ToolHelpers.ToJson(new {
+                    symbol = symbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                    references = references,
+                    totalShown = references.Count,
+                    maxShown = maxToShow,
+                    limitReached = references.Count >= maxToShow
+                });
+            } finally {
+                workspace?.Dispose();
+            }
+        }, logger, nameof(FindReferences_Stateless), cancellationToken);
+    }
+
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(ListImplementations_Stateless), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
+    [Description("Stateless version of ListImplementations. Gets the locations and FQNs of all implementations of an interface or abstract method. Works without a pre-loaded solution.")]
+    public static async Task<object> ListImplementations_Stateless(
+        StatelessWorkspaceFactory workspaceFactory,
+        ICodeAnalysisService codeAnalysisService,
+        IFuzzyFqnLookupService fuzzyFqnLookupService,
+        ILogger<AnalysisToolsLogCategory> logger,
+        [Description("Path to a file, project, or solution to search for implementations in.")] string contextPath,
+        [Description("The fully qualified name of the interface, abstract method, or base class.")] string fullyQualifiedSymbolName,
+        CancellationToken cancellationToken) {
+
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            ErrorHandlingHelpers.ValidateStringParameter(contextPath, nameof(contextPath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedSymbolName, "fullyQualifiedSymbolName", logger);
+
+            logger.LogInformation("Executing '{ListImplementations_Stateless}' for: {SymbolName} in context {ContextPath}",
+                nameof(ListImplementations_Stateless), fullyQualifiedSymbolName, contextPath);
+
+            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(contextPath);
+            
+            try {
+                Solution solution;
+                if (context is Solution sol) {
+                    solution = sol;
+                } else if (context is Project proj) {
+                    solution = proj.Solution;
+                } else {
+                    var dynamicContext = (dynamic)context;
+                    solution = ((Project)dynamicContext.Project).Solution;
+                }
+
+                var implementations = new List<object>();
+                
+                // Use fuzzy lookup to find the symbol
+                var fuzzyMatches = await fuzzyFqnLookupService.FindMatchesAsync(fullyQualifiedSymbolName, new StatelessSolutionManager(solution), cancellationToken);
+                var bestMatch = fuzzyMatches.FirstOrDefault();
+                if (bestMatch == null) {
+                    throw new McpException($"Symbol '{fullyQualifiedSymbolName}' not found in the workspace");
+                }
+                var roslynSymbol = bestMatch.Symbol;
+
+                try {
+                    if (roslynSymbol is INamedTypeSymbol namedTypeSymbol) {
+                        if (namedTypeSymbol.TypeKind == TypeKind.Interface) {
+                            // Use SymbolFinder directly with the stateless solution
+                            var implementingSymbols = await SymbolFinder.FindImplementationsAsync(namedTypeSymbol, solution, cancellationToken: cancellationToken);
+                            foreach (var impl in implementingSymbols.OfType<INamedTypeSymbol>()) {
+                                cancellationToken.ThrowIfCancellationRequested();
+                                implementations.Add(new {
+                                    kind = ToolHelpers.GetSymbolKindString(impl),
+                                    signature = CodeAnalysisService.GetFormattedSignatureAsync(impl, false),
+                                    fullyQualifiedName = FuzzyFqnLookupService.GetSearchableString(impl),
+                                    location = GetDeclarationLocationInfo(impl).FirstOrDefault()
+                                });
+                            }
+                        } else if (namedTypeSymbol.IsAbstract || namedTypeSymbol.TypeKind == TypeKind.Class) {
+                            // Use SymbolFinder directly with the stateless solution
+                            var derivedClasses = await SymbolFinder.FindDerivedClassesAsync(namedTypeSymbol, solution, cancellationToken: cancellationToken);
+                            foreach (var derived in derivedClasses) {
+                                cancellationToken.ThrowIfCancellationRequested();
+                                implementations.Add(new {
+                                    kind = ToolHelpers.GetSymbolKindString(derived),
+                                    signature = CodeAnalysisService.GetFormattedSignatureAsync(derived, false),
+                                    fullyQualifiedName = FuzzyFqnLookupService.GetSearchableString(derived),
+                                    location = GetDeclarationLocationInfo(derived).FirstOrDefault()
+                                });
+                            }
+                        }
+                    } else if (roslynSymbol is IMethodSymbol methodSymbol && (methodSymbol.IsAbstract || methodSymbol.IsVirtual)) {
+                        // Use SymbolFinder directly with the stateless solution
+                        var overrides = await SymbolFinder.FindOverridesAsync(methodSymbol, solution, cancellationToken: cancellationToken);
+                        foreach (var over in overrides.OfType<IMethodSymbol>()) {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            implementations.Add(new {
+                                kind = ToolHelpers.GetSymbolKindString(over),
+                                signature = CodeAnalysisService.GetFormattedSignatureAsync(over, false),
+                                fullyQualifiedName = FuzzyFqnLookupService.GetSearchableString(over),
+                                location = GetDeclarationLocationInfo(over).FirstOrDefault()
+                            });
+                        }
+                    }
+                } catch (Exception ex) {
+                    logger.LogWarning(ex, "Error finding implementations for {SymbolName}", fullyQualifiedSymbolName);
+                }
+
+                return ToolHelpers.ToJson(new {
+                    symbol = roslynSymbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+                    kind = ToolHelpers.GetSymbolKindString(roslynSymbol),
+                    implementations = implementations,
+                    totalFound = implementations.Count
+                });
+            } finally {
+                workspace?.Dispose();
+            }
+        }, logger, nameof(ListImplementations_Stateless), cancellationToken);
+    }
+
+    #endregion
 
     [GeneratedRegex(@"\s*\bclass\b\s*")]
     private static partial Regex ClassRegex();

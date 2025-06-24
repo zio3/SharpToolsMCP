@@ -25,6 +25,10 @@ public static class ServiceCollectionExtensions {
         services.AddSingleton<IComplexityAnalysisService, ComplexityAnalysisService>();
         services.AddSingleton<ISemanticSimilarityService, SemanticSimilarityService>();
         services.AddSingleton<ISourceResolutionService, SourceResolutionService>();
+        
+        // Stateless services
+        services.AddTransient<ProjectDiscoveryService>();
+        services.AddTransient<StatelessWorkspaceFactory>();
 
         return services;
     }
