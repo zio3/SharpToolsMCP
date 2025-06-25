@@ -403,15 +403,15 @@ public static partial class AnalysisTools {
     #region Main Methods
 
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(GetMembers), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
-    [Description("クラスやインターフェースのメンバー（メソッド、プロパティ、フィールド）を一覧表示します。APIの理解や実装の把握に最適です")]
+    [Description("Display members (methods, properties, fields) of classes and interfaces. Perfect for understanding APIs and implementation details")]
     public static async Task<object> GetMembers(
     StatelessWorkspaceFactory workspaceFactory,
     ICodeAnalysisService codeAnalysisService,
     IFuzzyFqnLookupService fuzzyFqnLookupService,
     ILogger<AnalysisToolsLogCategory> logger,
     [Description("Path to your project file (.csproj), solution (.sln), or any C# file in the project")] string contextPath,
-    [Description("調査対象のクラス名。完全修飾名（MyApp.Services.UserService）または短縮名（UserService）で指定")] string fullyQualifiedTypeName,
-    [Description("プライベートメンバーも含めて表示するか（true=全て表示、false=パブリックのみ）")] bool includePrivateMembers,
+    [Description("Target class name to analyze. Use fully qualified name (MyApp.Services.UserService) or short name (UserService)")] string fullyQualifiedTypeName,
+    [Description("Include private members in results (true=show all, false=public only)")] bool includePrivateMembers,
     CancellationToken cancellationToken = default) {
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
             ErrorHandlingHelpers.ValidateStringParameter(contextPath, nameof(contextPath), logger);
@@ -504,7 +504,7 @@ public static partial class AnalysisTools {
     }
 
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(GetMethodSignature), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
-    [Description("🔍 Safely view only the method signature without the body. Perfect for checking before using OverwriteMember. Example: 'MyClass.ProcessData'")]
+    [Description("🔍 Safely view method signature without the body. Perfect for checking before using OverwriteMember. Example: 'MyClass.ProcessData'")]
     public static async Task<string> GetMethodSignature(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeAnalysisService codeAnalysisService,
@@ -548,7 +548,19 @@ public static partial class AnalysisTools {
                 // Build the signature
                 var modifiers = ToolHelpers.GetRoslynSymbolModifiersString(methodSymbol);
                 var signature = CodeAnalysisService.GetFormattedSignatureAsync(methodSymbol, false);
+                // Remove duplicate modifiers if any
                 var fullSignature = $"{modifiers} {signature}".Trim();
+                
+                // Fix duplicate return type issue
+                if (methodSymbol.ReturnsVoid) {
+                    fullSignature = fullSignature.Replace("void void", "void");
+                } else {
+                    var returnType = methodSymbol.ReturnType.ToDisplayString();
+                    var duplicatePattern = $"{returnType} {returnType}";
+                    if (fullSignature.Contains(duplicatePattern)) {
+                        fullSignature = fullSignature.Replace(duplicatePattern, returnType);
+                    }
+                }
 
                 // Get XML documentation if available
                 string xmlDocs = await codeAnalysisService.GetXmlDocumentationAsync(methodSymbol, cancellationToken) ?? string.Empty;

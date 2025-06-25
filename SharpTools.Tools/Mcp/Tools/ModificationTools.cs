@@ -314,7 +314,7 @@ public static class ModificationTools {
     #region Main Methods
 
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(AddMember), Idempotent = false, Destructive = false, OpenWorld = false, ReadOnly = false)]
-    [Description("指定された型に新しいメンバー（メソッド、プロパティ、フィールドなど）を安全に追加します。重複チェックとコンパイルエラー検証を自動実行")]
+    [Description("Safely add new members (methods, properties, fields, etc.) to a specified type with automatic duplicate checking and compilation error validation")]
     public static async Task<string> AddMember(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
@@ -323,7 +323,8 @@ public static class ModificationTools {
         ISemanticSimilarityService semanticSimilarityService,
         ILogger<ModificationToolsLogCategory> logger,
         [Description("Path to the file containing the target type.")] string filePath,
-        [Description("追加するC#コード。完全なメンバー定義を記述してください（public string Name { get; set; } など）")] string codeSnippet,
+        [Description("The C# code to add. Include complete member definition (e.g., public string Name { get; set; })")] string codeSnippet,
+        [Description("Target type name for files with multiple types (e.g., 'MyClass'). Leave empty for single-type files.")] string targetTypeName = "",
         [Description("Optional file name hint for partial types. Use 'auto' to determine automatically.")] string fileNameHint = "auto",
         [Description("Suggest a line number to insert the member near. '-1' to determine automatically.")] int lineNumberHint = -1,
         CancellationToken cancellationToken = default) {
@@ -392,8 +393,24 @@ public static class ModificationTools {
                     }
                     targetTypeSymbol = namedTypeSymbol;
                 } else {
-                    // Multiple types - need to infer from context or fail
-                    throw new McpException($"⚠️ 複数の型定義が見つかりました\n💡 対応方法:\n• {ToolHelpers.SharpToolPrefix}ReadTypesFromRoslynDocument で型一覧を確認\n• 完全修飾名で対象の型を指定してください\n• 単一の型のみを含むファイルに対して実行することを推奨");
+                    // Multiple types - check if targetTypeName is provided
+                    if (string.IsNullOrWhiteSpace(targetTypeName)) {
+                        var typeNames = string.Join(", ", typeDeclarations.Select(t => t.Identifier.Text));
+                        throw new McpException($"⚠️ 複数の型定義が見つかりました: {typeNames}\n💡 対応方法:\n• targetTypeName パラメータで対象の型を指定してください\n• 例: targetTypeName: \"MyClass\"\n• {ToolHelpers.SharpToolPrefix}ReadTypesFromRoslynDocument で型一覧を確認");
+                    }
+                    
+                    // Find the target type by name
+                    targetTypeNode = typeDeclarations.FirstOrDefault(t => t.Identifier.Text == targetTypeName)!;
+                    if (targetTypeNode == null) {
+                        var availableTypes = string.Join(", ", typeDeclarations.Select(t => t.Identifier.Text));
+                        throw new McpException($"⚠️ 指定された型 '{targetTypeName}' が見つかりません\n利用可能な型: {availableTypes}");
+                    }
+                    
+                    var symbol = semanticModel.GetDeclaredSymbol(targetTypeNode);
+                    if (symbol is not INamedTypeSymbol namedTypeSymbol) {
+                        throw new McpException($"Could not get type symbol for {targetTypeNode.Identifier.Text}");
+                    }
+                    targetTypeSymbol = namedTypeSymbol;
                 }
 
                 // Check for duplicate members
@@ -586,13 +603,31 @@ public static class ModificationTools {
                 }
 
                 var newDocument = document.WithSyntaxRoot(newRoot);
+                
+                // Check if System.ComponentModel using is present
+                var compilationUnit = newRoot as CompilationUnitSyntax;
+                if (compilationUnit != null) {
+                    var hasComponentModelUsing = compilationUnit.Usings.Any(u => 
+                        u.Name?.ToString() == "System.ComponentModel");
+                    
+                    if (!hasComponentModelUsing) {
+                        // Add using directive
+                        var newUsing = SyntaxFactory.UsingDirective(
+                            SyntaxFactory.ParseName("System.ComponentModel"))
+                            .WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed);
+                        
+                        compilationUnit = compilationUnit.AddUsings(newUsing);
+                        newDocument = newDocument.WithSyntaxRoot(compilationUnit);
+                    }
+                }
+                
                 var formattedDocument = await modificationService.FormatDocumentAsync(newDocument, cancellationToken);
 
                 if (!workspace.TryApplyChanges(formattedDocument.Project.Solution)) {
                     throw new McpException("Failed to apply changes to the workspace");
                 }
 
-                return $"✅ Successfully updated Description attribute for method '{methodName}' in {filePath}";
+                return $"✅ Successfully updated Description attribute for method '{methodName}' in {filePath}\n💡 注: using System.ComponentModel; が自動追加されました（必要な場合）";
             } finally {
                 workspace.Dispose();
             }
@@ -600,7 +635,7 @@ public static class ModificationTools {
     }
 
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(OverwriteMember), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("⚠️ 【破壊的変更】既存メンバーを完全に置き換えます。必ずGetMethodSignatureで現在の実装を確認してから実行してください。不完全なコードは実装を削除する危険があります")]
+    [Description("⚠️ [DESTRUCTIVE] Completely replaces an existing member. Always use GetMethodSignature to check current implementation first. Incomplete code risks deleting the implementation")]
     public static async Task<string> OverwriteMember(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
@@ -735,14 +770,31 @@ public static class ModificationTools {
 
                     if (syntaxDiagnostics.Any()) {
                         var errorMessages = string.Join("\n", syntaxDiagnostics.Select(d => $"  - {d.GetMessage()}"));
-                        throw new McpException($"Syntax errors in provided code:\n{errorMessages}");
+                        
+                        // Provide specific guidance for common errors
+                        string additionalGuidance = "";
+                        if (errorMessages.Contains("expected") || errorMessages.Contains("Invalid token")) {
+                            additionalGuidance = "\n\n💡 よくある問題:\n" +
+                                               "• メソッド全体を提供してください（修飾子からボディまで）\n" +
+                                               "• 例: public void MyMethod() { /* implementation */ }\n" +
+                                               "• XMLコメントがある場合は含めてください\n" +
+                                               "• 不完全なコードは受け付けません";
+                        }
+                        
+                        throw new McpException($"構文エラーが検出されました:\n{errorMessages}{additionalGuidance}");
                     }
 
                     var parsedCode = SyntaxFactory.ParseCompilationUnit(newMemberCode);
                     newNode = parsedCode.Members.FirstOrDefault();
 
                     if (newNode is null) {
-                        throw new McpException("Failed to parse new code as a valid member or type declaration.");
+                        // Try parsing as a member declaration directly
+                        var memberNode = SyntaxFactory.ParseMemberDeclaration(newMemberCode);
+                        if (memberNode != null) {
+                            newNode = memberNode;
+                        } else {
+                            throw new McpException("コードを有効なメンバーまたは型宣言として解析できませんでした。\n💡 ヒント:\n• 完全なメソッド定義を提供してください\n• XMLコメントがある場合は含めてください\n• 例:\n/// <summary>\n/// メソッドの説明\n/// </summary>\npublic void MyMethod()\n{\n    // 実装\n}");
+                        }
                     }
 
                     // Validate type compatibility
@@ -961,13 +1013,31 @@ public static class ModificationTools {
                 }
 
                 var newDocument = document.WithSyntaxRoot(newRoot);
+                
+                // Check if System.ComponentModel using is present
+                var compilationUnit = newRoot as CompilationUnitSyntax;
+                if (compilationUnit != null) {
+                    var hasComponentModelUsing = compilationUnit.Usings.Any(u => 
+                        u.Name?.ToString() == "System.ComponentModel");
+                    
+                    if (!hasComponentModelUsing) {
+                        // Add using directive
+                        var newUsing = SyntaxFactory.UsingDirective(
+                            SyntaxFactory.ParseName("System.ComponentModel"))
+                            .WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed);
+                        
+                        compilationUnit = compilationUnit.AddUsings(newUsing);
+                        newDocument = newDocument.WithSyntaxRoot(compilationUnit);
+                    }
+                }
+                
                 var formattedDocument = await modificationService.FormatDocumentAsync(newDocument, cancellationToken);
 
                 if (!workspace.TryApplyChanges(formattedDocument.Project.Solution)) {
                     throw new McpException("Failed to apply changes to the workspace");
                 }
 
-                return $"✅ Successfully updated Description attribute for parameter '{parameterName}' in method '{methodName}' in {filePath}";
+                return $"✅ Successfully updated Description attribute for parameter '{parameterName}' in method '{methodName}' in {filePath}\n💡 注: using System.ComponentModel; が自動追加されました（必要な場合）";
             } finally {
                 workspace.Dispose();
             }

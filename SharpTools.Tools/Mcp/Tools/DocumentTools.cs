@@ -41,11 +41,11 @@ public static class DocumentTools {
         };
     }
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(ReadRawFromRoslynDocument), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
-    [Description("ファイルの内容を効率的に読み取ります。インデントを自動除去してトークン数を約10%削減し、AIが理解しやすい形式で返します")]
+    [Description("Efficiently reads file contents, automatically removes indentation to reduce token count by ~10%, and returns in an AI-friendly format")]
     public static async Task<string> ReadRawFromRoslynDocument(
         IDocumentOperationsService documentOperations,
         ILogger<DocumentToolsLogCategory> logger,
-        [Description("読み取り対象ファイルの絶対パス（例: C:\\\\MyProject\\\\Controllers\\\\HomeController.cs）")] string filePath,
+        [Description("Absolute path to the file to read (e.g., C:\\\\MyProject\\\\Controllers\\\\HomeController.cs)")] string filePath,
         CancellationToken cancellationToken = default) {
 
         const int LineCountWarningThreshold = 1000;
