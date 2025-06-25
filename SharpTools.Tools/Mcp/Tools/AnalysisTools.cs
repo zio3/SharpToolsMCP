@@ -591,9 +591,59 @@ public static partial class AnalysisTools {
 
                 // Use fuzzy lookup to find the symbol
                 var fuzzyMatches = await fuzzyFqnLookupService.FindMatchesAsync(methodIdentifier, new StatelessSolutionManager(solution), cancellationToken);
-                var bestMatch = fuzzyMatches.FirstOrDefault(m => m.Symbol is IMethodSymbol);
+                
+                // Find the best match considering parameter types if specified
+                FuzzyMatchResult? bestMatch = null;
+                IMethodSymbol? methodSymbol = null;
+                
+                // Check if the identifier includes parameter types (e.g., "Method(System.String)")
+                bool hasParameterSpecification = methodIdentifier.Contains("(");
+                
+                if (hasParameterSpecification) {
+                    // Try to find exact match based on parameter types
+                    foreach (var match in fuzzyMatches.Where(m => m.Symbol is IMethodSymbol)) {
+                        if (match.Symbol is IMethodSymbol method) {
+                            // Build the full signature for comparison
+                            var methodFullSig = $"{method.ContainingType.ToDisplayString()}.{method.Name}({string.Join(", ", method.Parameters.Select(p => p.Type.ToDisplayString()))})";
+                            var methodSimpleSig = $"{method.ContainingType.Name}.{method.Name}({string.Join(", ", method.Parameters.Select(p => p.Type.ToDisplayString()))})";
+                            var methodOnlySig = $"{method.Name}({string.Join(", ", method.Parameters.Select(p => p.Type.ToDisplayString()))})";
+                            
+                            // Normalize type names for comparison (System.String -> string, etc.)
+                            var normalizedIdentifier = methodIdentifier
+                                .Replace("System.String", "string")
+                                .Replace("System.Int32", "int")
+                                .Replace("System.Int64", "long")
+                                .Replace("System.Boolean", "bool")
+                                .Replace("System.Double", "double")
+                                .Replace("System.Single", "float")
+                                .Replace("System.Decimal", "decimal")
+                                .Replace("System.Byte", "byte")
+                                .Replace("System.Char", "char")
+                                .Replace("System.Object", "object");
+                            
+                            if (methodFullSig == methodIdentifier || 
+                                methodSimpleSig == methodIdentifier || 
+                                methodOnlySig == methodIdentifier ||
+                                methodFullSig == normalizedIdentifier ||
+                                methodSimpleSig == normalizedIdentifier ||
+                                methodOnlySig == normalizedIdentifier) {
+                                bestMatch = match;
+                                methodSymbol = method;
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // If no exact match found, fall back to first method match
+                if (bestMatch == null) {
+                    bestMatch = fuzzyMatches.FirstOrDefault(m => m.Symbol is IMethodSymbol);
+                    if (bestMatch != null && bestMatch.Symbol is IMethodSymbol ms) {
+                        methodSymbol = ms;
+                    }
+                }
 
-                if (bestMatch == null || !(bestMatch.Symbol is IMethodSymbol methodSymbol)) {
+                if (bestMatch == null || methodSymbol == null) {
                     throw new McpException($"🔍 メソッドが見つかりません: '{methodIdentifier}'\n💡 確認方法:\n• {ToolHelpers.SharpToolPrefix}{nameof(GetMembers)} で利用可能なメソッドを確認\n• 完全修飾名（MyClass.MyMethod）で試してください\n• 型名とメソッド名が正しいかを確認");
                 }
 

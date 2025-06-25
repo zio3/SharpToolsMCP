@@ -85,10 +85,7 @@ SharpTools exposes a variety of "SharpTool_*" functions via MCP. Here's a brief 
 
 ### Document Tools
 
-*   `SharpTool_ReadRawFromRoslynDocument`: Reads the raw content of a file (indentation omitted).
-*   `SharpTool_CreateRoslynDocument`: Creates a new file with specified content.
-*   `SharpTool_OverwriteRoslynDocument`: Overwrites an existing file with new content.
-*   `SharpTool_ReadTypesFromRoslynDocument`: Lists all types and their members defined within a specific source file.
+*   `SharpTool_ReadTypesFromRoslynDocument`: Lists all types and their members defined within a specific source file using Roslyn analysis. For basic file operations (read/write/create), use the filesystem tools provided by your MCP client.
 
 ### Modification Tools
 

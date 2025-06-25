@@ -105,6 +105,61 @@ public static class ModificationTools {
 
     // Helper method to match symbols with flexibility
     private static bool IsSymbolMatch(ISymbol symbol, string fullyQualifiedName) {
+        // For methods with parameter specification (e.g., "Process(int)" or "Process(System.Int32)")
+        if (symbol is IMethodSymbol methodSymbol && fullyQualifiedName.Contains("(")) {
+            // Try to match with parameter types
+            var methodSignature = BuildMethodSignature(methodSymbol);
+            if (methodSignature == fullyQualifiedName)
+                return true;
+            
+            // Also try with fully qualified parameter types
+            var fullMethodSignature = BuildMethodSignature(methodSymbol, useFullyQualifiedTypes: true);
+            if (fullMethodSignature == fullyQualifiedName)
+                return true;
+            
+            // Special handling for C# keyword types (System.String -> string, etc.)
+            var normalizedFullyQualifiedName = fullyQualifiedName
+                .Replace("System.String", "string")
+                .Replace("System.Int32", "int")
+                .Replace("System.Int64", "long")
+                .Replace("System.Boolean", "bool")
+                .Replace("System.Double", "double")
+                .Replace("System.Single", "float")
+                .Replace("System.Decimal", "decimal")
+                .Replace("System.Byte", "byte")
+                .Replace("System.Char", "char")
+                .Replace("System.Object", "object");
+            
+            // Try matching with normalized names
+            if (methodSignature == normalizedFullyQualifiedName)
+                return true;
+            if (fullMethodSignature == normalizedFullyQualifiedName)
+                return true;
+            
+            // Try matching with containing type
+            var fqnWithType = BuildFullyQualifiedName(symbol) + GetMethodParameters(methodSymbol);
+            if (fqnWithType == fullyQualifiedName || fqnWithType == normalizedFullyQualifiedName)
+                return true;
+            
+            // Also try with fully qualified parameter types for FQN
+            var fqnWithFullParams = BuildFullyQualifiedName(symbol) + GetMethodParameters(methodSymbol, useFullyQualifiedTypes: true);
+            if (fqnWithFullParams == fullyQualifiedName || fqnWithFullParams == normalizedFullyQualifiedName)
+                return true;
+                
+            // Try partial matches (e.g., "TestClass.Process(string)" for "TestProject.TestClass.Process")
+            var parts = BuildFullyQualifiedName(symbol).Split('.');
+            for (int i = 0; i < parts.Length - 1; i++) {
+                var partialFqn = string.Join(".", parts.Skip(i));
+                var partialWithParams = partialFqn + GetMethodParameters(methodSymbol);
+                if (partialWithParams == fullyQualifiedName || partialWithParams == normalizedFullyQualifiedName)
+                    return true;
+                    
+                var partialWithFullParams = partialFqn + GetMethodParameters(methodSymbol, useFullyQualifiedTypes: true);
+                if (partialWithFullParams == fullyQualifiedName || partialWithFullParams == normalizedFullyQualifiedName)
+                    return true;
+            }
+        }
+        
         // Direct name match (for simple names)
         if (symbol.Name == fullyQualifiedName)
             return true;
@@ -128,6 +183,43 @@ public static class ModificationTools {
 
         return false;
     }
+    
+    // Helper method to build method signature with parameter types
+    private static string BuildMethodSignature(IMethodSymbol method, bool useFullyQualifiedTypes = false) {
+        var signature = method.Name;
+        var parameters = method.Parameters.Select(p => {
+            if (useFullyQualifiedTypes) {
+                return p.Type.ToDisplayString();
+            } else {
+                // Use simple type names
+                var typeName = p.Type.Name;
+                if (p.Type is IArrayTypeSymbol arrayType) {
+                    typeName = arrayType.ElementType.Name + "[]";
+                }
+                return typeName;
+            }
+        });
+        
+        signature += "(" + string.Join(", ", parameters) + ")";
+        return signature;
+    }
+    
+    // Helper method to get method parameters for matching
+    private static string GetMethodParameters(IMethodSymbol method, bool useFullyQualifiedTypes = false) {
+        var parameters = method.Parameters.Select(p => {
+            if (useFullyQualifiedTypes) {
+                return p.Type.ToDisplayString();
+            } else {
+                // Use simple type names
+                var typeName = p.Type.Name;
+                if (p.Type is IArrayTypeSymbol arrayType) {
+                    typeName = arrayType.ElementType.Name + "[]";
+                }
+                return typeName;
+            }
+        });
+        return "(" + string.Join(", ", parameters) + ")";
+    }
 
     private static string BuildFullyQualifiedName(ISymbol symbol) {
         var parts = new List<string>();
@@ -147,9 +239,125 @@ public static class ModificationTools {
 
         return string.Join(".", parts);
     }
+
+    // Helper method to adjust node indentation
+    private static SyntaxNode AdjustNodeIndentation(SyntaxNode node, SyntaxTrivia indentationTrivia) {
+        var lines = node.ToFullString().Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None);
+        var adjustedLines = new List<string>();
+        
+        for (int i = 0; i < lines.Length; i++) {
+            if (i == 0) {
+                // First line: use as is (it will receive the indentation from replacement)
+                adjustedLines.Add(lines[i]);
+            } else if (!string.IsNullOrWhiteSpace(lines[i])) {
+                // Other non-empty lines: add the base indentation
+                adjustedLines.Add(indentationTrivia.ToString() + lines[i].TrimStart());
+            } else {
+                // Empty lines: keep as is
+                adjustedLines.Add(lines[i]);
+            }
+        }
+        
+        var adjustedText = string.Join(Environment.NewLine, adjustedLines);
+        var adjustedTree = SyntaxFactory.ParseSyntaxTree(adjustedText);
+        var adjustedRoot = adjustedTree.GetRoot();
+        
+        // Try to find the corresponding node in the adjusted tree
+        if (node is MemberDeclarationSyntax) {
+            var member = adjustedRoot.DescendantNodes().OfType<MemberDeclarationSyntax>().FirstOrDefault();
+            if (member != null) return member;
+        } else if (node is TypeDeclarationSyntax) {
+            var type = adjustedRoot.DescendantNodes().OfType<TypeDeclarationSyntax>().FirstOrDefault();
+            if (type != null) return type;
+        }
+        
+        // Fallback: parse as member declaration
+        return SyntaxFactory.ParseMemberDeclaration(adjustedText) ?? node;
+    }
     // Helper method to check if a string is a valid C# identifier
     private static bool IsValidCSharpIdentifier(string name) {
         return SyntaxFacts.IsValidIdentifier(name);
+    }
+    
+    // Helper method to apply access modifiers from old member to new member if missing
+    private static MemberDeclarationSyntax ApplyAccessModifiersIfMissing(MemberDeclarationSyntax oldMember, MemberDeclarationSyntax newMember) {
+        var oldModifiers = oldMember.Modifiers;
+        var newModifiers = newMember.Modifiers;
+        
+        // Check if new member has any access modifier
+        bool hasAccessModifier = newModifiers.Any(m => 
+            m.IsKind(SyntaxKind.PublicKeyword) ||
+            m.IsKind(SyntaxKind.PrivateKeyword) ||
+            m.IsKind(SyntaxKind.ProtectedKeyword) ||
+            m.IsKind(SyntaxKind.InternalKeyword));
+        
+        // If no access modifier, copy from old member
+        if (!hasAccessModifier) {
+            var accessModifiers = oldModifiers.Where(m =>
+                m.IsKind(SyntaxKind.PublicKeyword) ||
+                m.IsKind(SyntaxKind.PrivateKeyword) ||
+                m.IsKind(SyntaxKind.ProtectedKeyword) ||
+                m.IsKind(SyntaxKind.InternalKeyword)).ToList();
+            
+            if (accessModifiers.Any()) {
+                // Create new modifiers with proper spacing
+                var newModifierTokens = new List<SyntaxToken>();
+                
+                // Add access modifiers first
+                foreach (var modifier in accessModifiers) {
+                    var modToken = SyntaxFactory.Token(modifier.Kind());
+                    // Add trailing space to the modifier
+                    modToken = modToken.WithTrailingTrivia(SyntaxFactory.Space);
+                    newModifierTokens.Add(modToken);
+                }
+                
+                // Add existing modifiers (if any)
+                foreach (var existingModifier in newModifiers) {
+                    newModifierTokens.Add(existingModifier);
+                }
+                
+                // Apply the new modifiers without affecting leading trivia
+                newMember = newMember.WithModifiers(SyntaxFactory.TokenList(newModifierTokens));
+            }
+        }
+        
+        // Also copy other important modifiers if missing
+        var importantModifiers = new[] {
+            SyntaxKind.StaticKeyword,
+            SyntaxKind.VirtualKeyword,
+            SyntaxKind.OverrideKeyword,
+            SyntaxKind.AbstractKeyword,
+            SyntaxKind.SealedKeyword,
+            SyntaxKind.AsyncKeyword,
+            SyntaxKind.ReadOnlyKeyword,
+            SyntaxKind.PartialKeyword,
+            SyntaxKind.ExternKeyword
+        };
+        
+        foreach (var modifierKind in importantModifiers) {
+            if (oldModifiers.Any(m => m.IsKind(modifierKind)) && !newModifiers.Any(m => m.IsKind(modifierKind))) {
+                var modToken = SyntaxFactory.Token(modifierKind).WithTrailingTrivia(SyntaxFactory.Space);
+                
+                // Find the correct position to insert the modifier
+                var existingModifiers = newMember.Modifiers.ToList();
+                var insertIndex = 0;
+                
+                // Insert after access modifiers but before other modifiers
+                for (int i = 0; i < existingModifiers.Count; i++) {
+                    if (existingModifiers[i].IsKind(SyntaxKind.PublicKeyword) ||
+                        existingModifiers[i].IsKind(SyntaxKind.PrivateKeyword) ||
+                        existingModifiers[i].IsKind(SyntaxKind.ProtectedKeyword) ||
+                        existingModifiers[i].IsKind(SyntaxKind.InternalKeyword)) {
+                        insertIndex = i + 1;
+                    }
+                }
+                
+                existingModifiers.Insert(insertIndex, modToken);
+                newMember = newMember.WithModifiers(SyntaxFactory.TokenList(existingModifiers));
+            }
+        }
+        
+        return newMember;
     }
 
     // Legacy stateful MoveMember has been removed - use the stateless version in #region Main Methods
@@ -424,6 +632,19 @@ public static class ModificationTools {
 
                 // Format the new member with proper indentation
                 var formattedMember = memberSyntax.NormalizeWhitespace();
+
+                // Special handling for interface members
+                if (targetTypeNode is InterfaceDeclarationSyntax && memberSyntax is MethodDeclarationSyntax methodDecl) {
+                    // Interface methods should not have bodies
+                    if (methodDecl.Body != null || methodDecl.ExpressionBody != null) {
+                        // Remove body and expression body, add semicolon
+                        formattedMember = methodDecl
+                            .WithBody(null)
+                            .WithExpressionBody(null)
+                            .WithSemicolonToken(SyntaxFactory.Token(SyntaxKind.SemicolonToken))
+                            .NormalizeWhitespace();
+                    }
+                }
 
                 // Add the member to the type
                 editor.AddMember(targetTypeNode, formattedMember);
@@ -764,35 +985,140 @@ public static class ModificationTools {
 
                 SyntaxNode? newNode;
                 try {
-                    // PRE-PARSE VALIDATION: Check for syntax errors before processing
-                    var syntaxTree = CSharpSyntaxTree.ParseText(newMemberCode);
-                    var syntaxDiagnostics = syntaxTree.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
-
-                    if (syntaxDiagnostics.Any()) {
-                        var errorMessages = string.Join("\n", syntaxDiagnostics.Select(d => $"  - {d.GetMessage()}"));
+                    // Check if the code starts with XML documentation comments to avoid duplication issues
+                    var trimmedCode = newMemberCode.TrimStart();
+                    bool startsWithXmlDoc = trimmedCode.StartsWith("///");
+                    
+                    // Parse the member code and handle access modifiers properly
+                    if (oldNode is MemberDeclarationSyntax oldMemberForAccess) {
+                        // Extract all modifiers from old member (access, static, etc.)
+                        var oldModifiers = oldMemberForAccess.Modifiers;
+                        var accessModifiers = oldModifiers
+                            .Where(m => m.IsKind(SyntaxKind.PublicKeyword) ||
+                                       m.IsKind(SyntaxKind.PrivateKeyword) ||
+                                       m.IsKind(SyntaxKind.ProtectedKeyword) ||
+                                       m.IsKind(SyntaxKind.InternalKeyword))
+                            .ToList();
                         
-                        // Provide specific guidance for common errors
-                        string additionalGuidance = "";
-                        if (errorMessages.Contains("expected") || errorMessages.Contains("Invalid token")) {
-                            additionalGuidance = "\n\n💡 よくある問題:\n" +
-                                               "• メソッド全体を提供してください（修飾子からボディまで）\n" +
-                                               "• 例: public void MyMethod() { /* implementation */ }\n" +
-                                               "• XMLコメントがある場合は含めてください\n" +
-                                               "• 不完全なコードは受け付けません";
+                        var hasStaticModifier = oldModifiers.Any(m => m.IsKind(SyntaxKind.StaticKeyword));
+                        
+                        // Check if the new code lacks access modifiers
+                        // More robust check - parse the code to see if it has modifiers
+                        var tempParsed = SyntaxFactory.ParseMemberDeclaration(newMemberCode);
+                        bool lacksAccessModifier = tempParsed != null && 
+                                                  !tempParsed.Modifiers.Any(m => 
+                                                      m.IsKind(SyntaxKind.PublicKeyword) ||
+                                                      m.IsKind(SyntaxKind.PrivateKeyword) ||
+                                                      m.IsKind(SyntaxKind.ProtectedKeyword) ||
+                                                      m.IsKind(SyntaxKind.InternalKeyword));
+                        
+                        // If old had access modifier and new lacks it, prepend it to the method signature
+                        if (accessModifiers.Any() && lacksAccessModifier) {
+                            // Build modifier string - only add modifiers that were in the original
+                            var modifierString = string.Join(" ", accessModifiers.Select(m => m.Text));
+                            
+                            // Only preserve static if the new code doesn't already specify it and the old had it
+                            bool newHasStatic = tempParsed != null && tempParsed.Modifiers.Any(m => m.IsKind(SyntaxKind.StaticKeyword));
+                            if (hasStaticModifier && !newHasStatic) {
+                                // We need to handle static separately to ensure correct order
+                                // The correct order is: access modifier, then static, then return type
+                                // But we'll add it with the signature rewriting below
+                            }
+                            
+                            // Find where to insert the access modifier (after XML docs)
+                            var lines = newMemberCode.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+                            var modifiedLines = new List<string>();
+                            bool foundSignature = false;
+                            
+                            foreach (var line in lines) {
+                                var trimmedLine = line.TrimStart();
+                                if (!foundSignature && !trimmedLine.StartsWith("///") && !trimmedLine.StartsWith("//") && 
+                                    !string.IsNullOrWhiteSpace(trimmedLine) && !trimmedLine.StartsWith("[")) {
+                                    // This is the first non-comment, non-attribute line - insert access modifier here
+                                    var leadingWhitespace = line.Substring(0, line.Length - line.TrimStart().Length);
+                                    
+                                    // Check if we need to add static as well
+                                    var fullModifierString = modifierString;
+                                    if (hasStaticModifier && !newHasStatic && !trimmedLine.Contains("static")) {
+                                        fullModifierString += " static";
+                                    }
+                                    
+                                    modifiedLines.Add(leadingWhitespace + fullModifierString + " " + trimmedLine);
+                                    foundSignature = true;
+                                } else {
+                                    modifiedLines.Add(line);
+                                }
+                            }
+                            
+                            newMemberCode = string.Join(Environment.NewLine, modifiedLines);
+                        } else if (hasStaticModifier && tempParsed != null && !tempParsed.Modifiers.Any(m => m.IsKind(SyntaxKind.StaticKeyword))) {
+                            // Handle the case where we have static but no access modifier changes needed
+                            // This is for cases where the new code has access modifiers but is missing static
+                            var lines = newMemberCode.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+                            var modifiedLines = new List<string>();
+                            bool foundSignature = false;
+                            
+                            foreach (var line in lines) {
+                                var trimmedLine = line.TrimStart();
+                                if (!foundSignature && !trimmedLine.StartsWith("///") && !trimmedLine.StartsWith("//") && 
+                                    !string.IsNullOrWhiteSpace(trimmedLine) && !trimmedLine.StartsWith("[")) {
+                                    // Find where to insert static (after access modifiers)
+                                    var leadingWhitespace = line.Substring(0, line.Length - line.TrimStart().Length);
+                                    
+                                    // Check if line starts with access modifier
+                                    if (trimmedLine.StartsWith("public ") || trimmedLine.StartsWith("private ") || 
+                                        trimmedLine.StartsWith("protected ") || trimmedLine.StartsWith("internal ")) {
+                                        // Find the end of access modifier
+                                        var spaceIndex = trimmedLine.IndexOf(' ');
+                                        var beforeModifier = trimmedLine.Substring(0, spaceIndex + 1);
+                                        var afterModifier = trimmedLine.Substring(spaceIndex + 1);
+                                        modifiedLines.Add(leadingWhitespace + beforeModifier + "static " + afterModifier);
+                                    } else {
+                                        // No access modifier, add static at the beginning
+                                        modifiedLines.Add(leadingWhitespace + "static " + trimmedLine);
+                                    }
+                                    foundSignature = true;
+                                } else {
+                                    modifiedLines.Add(line);
+                                }
+                            }
+                            
+                            newMemberCode = string.Join(Environment.NewLine, modifiedLines);
+                        }
+                    }
+                    
+                    // First try parsing as a member declaration (methods, properties, fields, etc.)
+                    // This is the primary parsing method for most cases
+                    newNode = SyntaxFactory.ParseMemberDeclaration(newMemberCode);
+                    
+                    if (newNode is null) {
+                        // If ParseMemberDeclaration fails, check if it's a type declaration
+                        // Try parsing the code to check for syntax errors first
+                        var syntaxTree = CSharpSyntaxTree.ParseText(newMemberCode);
+                        var syntaxDiagnostics = syntaxTree.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
+
+                        if (syntaxDiagnostics.Any()) {
+                            var errorMessages = string.Join("\n", syntaxDiagnostics.Select(d => $"  - {d.GetMessage()}"));
+                            
+                            // Provide specific guidance for common errors
+                            string additionalGuidance = "";
+                            if (errorMessages.Contains("expected") || errorMessages.Contains("Invalid token")) {
+                                additionalGuidance = "\n\n💡 よくある問題:\n" +
+                                                   "• メソッド全体を提供してください（修飾子からボディまで）\n" +
+                                                   "• 例: public void MyMethod() { /* implementation */ }\n" +
+                                                   "• XMLコメントがある場合は含めてください\n" +
+                                                   "• 不完全なコードは受け付けません";
+                            }
+                            
+                            throw new McpException($"構文エラーが検出されました:\n{errorMessages}{additionalGuidance}");
                         }
                         
-                        throw new McpException($"構文エラーが検出されました:\n{errorMessages}{additionalGuidance}");
-                    }
-
-                    var parsedCode = SyntaxFactory.ParseCompilationUnit(newMemberCode);
-                    newNode = parsedCode.Members.FirstOrDefault();
-
-                    if (newNode is null) {
-                        // Try parsing as a member declaration directly
-                        var memberNode = SyntaxFactory.ParseMemberDeclaration(newMemberCode);
-                        if (memberNode != null) {
-                            newNode = memberNode;
-                        } else {
+                        // If no syntax errors, it might be a type declaration
+                        // Try parsing as a compilation unit (for namespace-level types)
+                        var parsedCode = SyntaxFactory.ParseCompilationUnit(newMemberCode);
+                        newNode = parsedCode.Members.FirstOrDefault();
+                        
+                        if (newNode is null) {
                             throw new McpException("コードを有効なメンバーまたは型宣言として解析できませんでした。\n💡 ヒント:\n• 完全なメソッド定義を提供してください\n• XMLコメントがある場合は含めてください\n• 例:\n/// <summary>\n/// メソッドの説明\n/// </summary>\npublic void MyMethod()\n{\n    // 実装\n}");
                         }
                     }
@@ -863,11 +1189,18 @@ public static class ModificationTools {
                     throw new McpException($"Invalid C# syntax in replacement code: {ex.Message}");
                 }
 
+                // Don't apply access modifiers automatically if the parsed node already has proper structure
+                // The access modifier handling is now done during string manipulation before parsing
+                
                 // Use DocumentEditor to replace the node
                 var editor2 = await DocumentEditor.CreateAsync(document, cancellationToken);
-                editor2.ReplaceNode(oldNode, newNode.WithTriviaFrom(oldNode));
+                
+                // Replace node without preserving all trivia
+                editor2.ReplaceNode(oldNode, newNode);
 
                 var changedDocument2 = editor2.GetChangedDocument();
+                
+                // Format the document to fix indentation
                 var formattedDocument2 = await Formatter.FormatAsync(changedDocument2, options: null, cancellationToken);
                 var newSolution2 = formattedDocument2.Project.Solution;
 
@@ -1214,9 +1547,22 @@ public static class ModificationTools {
                 if (newContent != originalContent) {
                     await statelessDocOps.WriteFileAsync(filePath, newContent, true, cancellationToken);
                     var diff = ContextInjectors.CreateCodeDiff(originalContent, newContent);
-                    return $"Successfully replaced pattern in non-code file {filePath}.\n\n{diff}";
+                    var matchCount = regex.Matches(originalContent).Count;
+                    return $"✅ {matchCount}件の置換を実行しました in non-code file {filePath}.\n\n{diff}";
                 } else {
-                    throw new McpException($"No matches found for pattern '{regexPattern}' in file '{filePath}', or replacement produced identical text.");
+                    // Check if pattern exists in file
+                    var matchCount = regex.Matches(originalContent).Count;
+                    if (matchCount == 0) {
+                        throw new McpException($"❌ パターンが見つかりません: '{regexPattern}'\n" +
+                                             $"📁 ファイル: {filePath}\n" +
+                                             $"💡 確認事項:\n" +
+                                             $"• 正規表現パターンが正しいか確認\n" +
+                                             $"• 大文字・小文字の区別を確認\n" + 
+                                             $"• エスケープが必要な文字（.[]()など）を確認");
+                    } else {
+                        throw new McpException($"⚠️ {matchCount}件のマッチが見つかりましたが、置換後のテキストが同じです\n" +
+                                             $"💡 置換テキストが元のテキストと同じ可能性があります");
+                    }
                 }
             }
 
@@ -1238,7 +1584,20 @@ public static class ModificationTools {
                 var newText = regex.Replace(sourceText.ToString(), replacementText);
 
                 if (newText == sourceText.ToString()) {
-                    throw new McpException($"No matches found for pattern '{regexPattern}' in file '{filePath}', or replacement produced identical text.");
+                    // Check if pattern exists in file
+                    var matchCount = regex.Matches(sourceText.ToString()).Count;
+                    if (matchCount == 0) {
+                        throw new McpException($"❌ パターンが見つかりません: '{regexPattern}'\n" +
+                                             $"📁 ファイル: {filePath}\n" +
+                                             $"💡 確認事項:\n" +
+                                             $"• 正規表現パターンが正しいか確認\n" +
+                                             $"• 大文字・小文字の区別を確認\n" + 
+                                             $"• エスケープが必要な文字（.[]()など）を確認\n" +
+                                             $"• {ToolHelpers.SharpToolPrefix}GetMembers でファイル内容を確認");
+                    } else {
+                        throw new McpException($"⚠️ {matchCount}件のマッチが見つかりましたが、置換後のテキストが同じです\n" +
+                                             $"💡 置換テキストが元のテキストと同じ可能性があります");
+                    }
                 }
 
                 // Apply the changes using SourceText
@@ -1270,10 +1629,17 @@ public static class ModificationTools {
                         ? $"<errorCheck>Compilation errors detected:\n{string.Join("\n", diagnostics.Select(d => $"- {d.GetMessage()}"))}</errorCheck>"
                         : "<errorCheck>No compilation issues detected.</errorCheck>";
 
-                    return $"Successfully replaced pattern '{regexPattern}' with '{replacementText}' in {filePath}.\n\n{errorMessages}\n\n{diff}";
+                    var matchCount = regex.Matches(originalTextContent.ToString()).Count;
+                    return $"✅ {matchCount}件の置換を実行しました\n" +
+                           $"📁 ファイル: {filePath}\n" +
+                           $"🔍 パターン: '{regexPattern}'\n" +
+                           $"📝 置換テキスト: '{replacementText}'\n\n{errorMessages}\n\n{diff}";
                 }
 
-                return $"Successfully replaced pattern '{regexPattern}' with '{replacementText}' in {filePath}.";
+                return $"✅ 置換を実行しました\n" +
+                       $"📁 ファイル: {filePath}\n" +
+                       $"🔍 パターン: '{regexPattern}'\n" +
+                       $"📝 置換テキスト: '{replacementText}'";
 
             } finally {
                 workspace.Dispose();
