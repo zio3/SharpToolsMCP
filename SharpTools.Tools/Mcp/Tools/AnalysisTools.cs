@@ -403,15 +403,15 @@ public static partial class AnalysisTools {
     #region Main Methods
 
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(GetMembers), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
-    [Description("🔍 Explore a class or interface - see all its methods, properties, and fields. Perfect for understanding APIs or learning how a type works. Example: 'System.String' or 'MyProject.MyClass'")]
+    [Description("クラスやインターフェースのメンバー（メソッド、プロパティ、フィールド）を一覧表示します。APIの理解や実装の把握に最適です")]
     public static async Task<object> GetMembers(
     StatelessWorkspaceFactory workspaceFactory,
     ICodeAnalysisService codeAnalysisService,
     IFuzzyFqnLookupService fuzzyFqnLookupService,
     ILogger<AnalysisToolsLogCategory> logger,
     [Description("Path to your project file (.csproj), solution (.sln), or any C# file in the project")] string contextPath,
-    [Description("The class or interface name. Examples: 'System.String', 'MyNamespace.MyClass', or just 'MyClass'")] string fullyQualifiedTypeName,
-    [Description("Include private members? Set to true to see everything, false for only public members")] bool includePrivateMembers,
+    [Description("調査対象のクラス名。完全修飾名（MyApp.Services.UserService）または短縮名（UserService）で指定")] string fullyQualifiedTypeName,
+    [Description("プライベートメンバーも含めて表示するか（true=全て表示、false=パブリックのみ）")] bool includePrivateMembers,
     CancellationToken cancellationToken = default) {
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
             ErrorHandlingHelpers.ValidateStringParameter(contextPath, nameof(contextPath), logger);
@@ -437,7 +437,7 @@ public static partial class AnalysisTools {
                 var fuzzyMatches = await fuzzyFqnLookupService.FindMatchesAsync(fullyQualifiedTypeName, new StatelessSolutionManager(solution), cancellationToken);
                 var bestMatch = fuzzyMatches.FirstOrDefault();
                 if (bestMatch == null || !(bestMatch.Symbol is INamedTypeSymbol namedTypeSymbol)) {
-                    throw new McpException($"Type '{fullyQualifiedTypeName}' not found in the workspace");
+                    throw new McpException($"🔍 型が見つかりません: '{fullyQualifiedTypeName}'\n💡 確認方法:\n• {ToolHelpers.SharpToolPrefix}{nameof(Tools.DocumentTools.ReadTypesFromRoslynDocument)} で利用可能な型を確認\n• 完全修飾名（MyApp.Models.User）で試してください\n• 名前空間が正しいかを確認");
                 }
 
                 string typeName = ToolHelpers.RemoveGlobalPrefix(namedTypeSymbol.ToDisplayString(ToolHelpers.FullyQualifiedFormatWithoutGlobal));
@@ -538,7 +538,7 @@ public static partial class AnalysisTools {
                 var bestMatch = fuzzyMatches.FirstOrDefault(m => m.Symbol is IMethodSymbol);
 
                 if (bestMatch == null || !(bestMatch.Symbol is IMethodSymbol methodSymbol)) {
-                    throw new McpException($"⚠️ Method '{methodIdentifier}' not found in the workspace");
+                    throw new McpException($"🔍 メソッドが見つかりません: '{methodIdentifier}'\n💡 確認方法:\n• {ToolHelpers.SharpToolPrefix}{nameof(GetMembers)} で利用可能なメソッドを確認\n• 完全修飾名（MyClass.MyMethod）で試してください\n• 型名とメソッド名が正しいかを確認");
                 }
 
                 // Get the declaration location

@@ -41,11 +41,11 @@ public static class DocumentTools {
         };
     }
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(ReadRawFromRoslynDocument), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
-    [Description("Reads the content of a file without requiring a pre-loaded solution. Omits indentation to save tokens.")]
+    [Description("ファイルの内容を効率的に読み取ります。インデントを自動除去してトークン数を約10%削減し、AIが理解しやすい形式で返します")]
     public static async Task<string> ReadRawFromRoslynDocument(
         IDocumentOperationsService documentOperations,
         ILogger<DocumentToolsLogCategory> logger,
-        [Description("The absolute path to the file to read.")] string filePath,
+        [Description("読み取り対象ファイルの絶対パス（例: C:\\\\MyProject\\\\Controllers\\\\HomeController.cs）")] string filePath,
         CancellationToken cancellationToken = default) {
 
         const int LineCountWarningThreshold = 1000;
@@ -57,18 +57,18 @@ public static class DocumentTools {
             logger.LogInformation("Reading document at {FilePath} (stateless)", filePath);
 
             if (!File.Exists(filePath)) {
-                throw new McpException($"File not found: {filePath}");
+                throw new McpException($"📁 ファイルが見つかりません: {filePath}\n💡 次のステップ:\n• パスが正しいかを確認\n• SharpTool_ReadTypesFromRoslynDocumentで構造を確認\n• 絶対パスを使用することを推奨");
             }
 
             try {
                 // Direct file I/O for stateless version
                 var content = await File.ReadAllTextAsync(filePath, cancellationToken);
-                
+
                 // Omit indentation to save tokens
                 var lines = content.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
                 var trimmedLines = lines.Select(line => line.TrimStart());
                 var trimmedContent = string.Join(Environment.NewLine, trimmedLines);
-                
+
                 var lineCount = lines.Length;
 
                 if (lineCount > LineCountWarningThreshold) {
@@ -87,7 +87,7 @@ public static class DocumentTools {
                 return trimmedContent;
             } catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException) {
                 logger.LogError(ex, "File not found: {FilePath}", filePath);
-                throw new McpException($"File not found: {filePath}");
+                throw new McpException($"📁 ファイルが見つかりません: {filePath}\n💡 次のステップ:\n• パスが正しいかを確認\n• SharpTool_ReadTypesFromRoslynDocumentで構造を確認\n• 絶対パスを使用することを推奨");
             } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException) {
                 logger.LogError(ex, "Failed to read file due to access restrictions: {FilePath}", filePath);
                 throw new McpException($"Failed to read file due to access restrictions: {ex.Message}");
@@ -115,7 +115,7 @@ public static class DocumentTools {
 
             // Check if file exists
             if (documentOperations.FileExists(filePath)) {
-                throw new McpException($"File already exists at {filePath}. Use '{ToolHelpers.SharpToolPrefix}{nameof(ReadRawFromRoslynDocument)}' to understand its contents. Then you can use '{ToolHelpers.SharpToolPrefix}{nameof(OverwriteRoslynDocument)}' if you decide to overwrite what exists.");
+                throw new McpException($"⚠️ ファイルが既に存在します: {filePath}\n💡 次のアクション:\n• 内容を確認: {ToolHelpers.SharpToolPrefix}{nameof(ReadRawFromRoslynDocument)}\n• 上書きする場合: {ToolHelpers.SharpToolPrefix}{nameof(OverwriteRoslynDocument)}");
             }
 
             try {
@@ -124,7 +124,7 @@ public static class DocumentTools {
                 if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory)) {
                     Directory.CreateDirectory(directory);
                 }
-                
+
                 // Direct file I/O for stateless version
                 await File.WriteAllTextAsync(filePath, content, cancellationToken);
 
@@ -132,7 +132,7 @@ public static class DocumentTools {
                 bool isCodeFile = documentOperations.IsCodeFile(filePath);
                 var fileType = isCodeFile ? "code" : "non-code";
 
-                return $"Created {fileType} file: {filePath}";
+                return $"✅ {fileType}ファイルを作成しました: {filePath}\n\n💡 次のステップ:\n• 内容確認: {ToolHelpers.SharpToolPrefix}{nameof(ReadRawFromRoslynDocument)}\n• 型情報表示: {ToolHelpers.SharpToolPrefix}{nameof(ReadTypesFromRoslynDocument)}\n• メンバー追加: {ToolHelpers.SharpToolPrefix}AddMember";
             } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException) {
                 logger.LogError(ex, "Failed to create file due to IO or access restrictions: {FilePath}", filePath);
                 throw new McpException($"Failed to create file due to IO or access restrictions: {ex.Message}");
@@ -160,7 +160,7 @@ public static class DocumentTools {
 
             // Check if file exists
             if (!documentOperations.FileExists(filePath)) {
-                throw new McpException($"File does not exist at {filePath}. Use '{ToolHelpers.SharpToolPrefix}{nameof(CreateRoslynDocument)}' to create it first.");
+                throw new McpException($"📁 ファイルが存在しません: {filePath}\n💡 次のアクション:\n• 新規作成: {ToolHelpers.SharpToolPrefix}{nameof(CreateRoslynDocument)}\n• パスを確認してください");
             }
 
             try {
@@ -202,7 +202,7 @@ public static class DocumentTools {
             logger.LogInformation("Reading types from document at {FilePath} (stateless)", filePath);
 
             var (workspace, project, document) = await workspaceFactory.CreateForFileAsync(filePath);
-            
+
             try {
                 if (document == null) {
                     throw new McpException($"Could not load document from file: {filePath}");

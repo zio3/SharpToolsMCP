@@ -314,7 +314,7 @@ public static class ModificationTools {
     #region Main Methods
 
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(AddMember), Idempotent = false, Destructive = false, OpenWorld = false, ReadOnly = false)]
-    [Description("Adds one or more new member definitions to a specified type in a file. Works without a pre-loaded solution.")]
+    [Description("指定された型に新しいメンバー（メソッド、プロパティ、フィールドなど）を安全に追加します。重複チェックとコンパイルエラー検証を自動実行")]
     public static async Task<string> AddMember(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
@@ -323,7 +323,7 @@ public static class ModificationTools {
         ISemanticSimilarityService semanticSimilarityService,
         ILogger<ModificationToolsLogCategory> logger,
         [Description("Path to the file containing the target type.")] string filePath,
-        [Description("The C# code snippet to add as a member.")] string codeSnippet,
+        [Description("追加するC#コード。完全なメンバー定義を記述してください（public string Name { get; set; } など）")] string codeSnippet,
         [Description("Optional file name hint for partial types. Use 'auto' to determine automatically.")] string fileNameHint = "auto",
         [Description("Suggest a line number to insert the member near. '-1' to determine automatically.")] int lineNumberHint = -1,
         CancellationToken cancellationToken = default) {
@@ -334,7 +334,7 @@ public static class ModificationTools {
             codeSnippet = codeSnippet.TrimBackslash();
 
             if (!File.Exists(filePath)) {
-                throw new McpException($"File not found: {filePath}");
+                throw new McpException($"📁 ファイルが見つかりません: {filePath}\n💡 確認方法:\n• パスが正しいかを確認（絶対パス推奨）\n• {ToolHelpers.SharpToolPrefix}ReadTypesFromRoslynDocument で構造を確認");
             }
 
             logger.LogInformation("Executing '{AddMember}' for file: {FilePath}", nameof(AddMember), filePath);
@@ -393,7 +393,7 @@ public static class ModificationTools {
                     targetTypeSymbol = namedTypeSymbol;
                 } else {
                     // Multiple types - need to infer from context or fail
-                    throw new McpException($"Multiple type declarations found in file. Please use the full AddMember tool with a specific FQN.");
+                    throw new McpException($"⚠️ 複数の型定義が見つかりました\n💡 対応方法:\n• {ToolHelpers.SharpToolPrefix}ReadTypesFromRoslynDocument で型一覧を確認\n• 完全修飾名で対象の型を指定してください\n• 単一の型のみを含むファイルに対して実行することを推奨");
                 }
 
                 // Check for duplicate members
@@ -463,7 +463,7 @@ public static class ModificationTools {
                     }
                 }
 
-                string baseMessage = $"Successfully added member to {targetTypeSymbol.ToDisplayString()} in {filePath}.\n\n" +
+                string baseMessage = $"✅ メンバーを正常に追加しました to {targetTypeSymbol.ToDisplayString()} in {filePath}.\n\n" +
                     (string.IsNullOrEmpty(errorMessages) ? "<errorCheck>No compilation issues detected.</errorCheck>" :
                     ($"<errorCheck>Compilation errors detected:\n{errorMessages}</errorCheck>\n\n" +
                     $"If you choose to fix these issues, you must use {ToolHelpers.SharpToolPrefix + nameof(OverwriteMember)} to replace the member with a new definition."));
@@ -476,7 +476,7 @@ public static class ModificationTools {
     }
 
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(UpdateToolDescription), Idempotent = false, Destructive = false, OpenWorld = false, ReadOnly = false)]
-    [Description("🎯 Safely update only the Description attribute of a SharpTool method without touching the method body")]
+    [Description("🎯 Safely update only the Description attribute of a SharpTool method without touching the method body - SAFETY ENHANCED VERSION")]
     public static async Task<string> UpdateToolDescription(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
@@ -484,17 +484,14 @@ public static class ModificationTools {
         [Description("Path to the C# file containing the tool method")] string filePath,
         [Description("The method name to update (e.g., 'GetMembers')")] string methodName,
         [Description("The new description text (without [Description(...)] wrapper)")] string newDescription,
-        CancellationToken cancellationToken = default)
-    {
-        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () =>
-        {
+        CancellationToken cancellationToken = default) {
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
             ErrorHandlingHelpers.ValidateStringParameter(filePath, nameof(filePath), logger);
             ErrorHandlingHelpers.ValidateStringParameter(methodName, nameof(methodName), logger);
             ErrorHandlingHelpers.ValidateStringParameter(newDescription, nameof(newDescription), logger);
 
-            if (!File.Exists(filePath))
-            {
-                throw new McpException($"File not found: {filePath}");
+            if (!File.Exists(filePath)) {
+                throw new McpException($"📁 ファイルが見つかりません: {filePath}\n💡 確認方法:\n• パスが正しいかを確認（絶対パス推奨）\n• {ToolHelpers.SharpToolPrefix}ReadTypesFromRoslynDocument で構造を確認");
             }
 
             logger.LogInformation("Executing '{UpdateToolDescription}' for method: {MethodName} in file: {FilePath}",
@@ -502,16 +499,13 @@ public static class ModificationTools {
 
             var (workspace, project, document) = await workspaceFactory.CreateForFileAsync(filePath);
 
-            try
-            {
-                if (document == null)
-                {
+            try {
+                if (document == null) {
                     throw new McpException($"File {filePath} not found in the project");
                 }
 
                 var root = await document.GetSyntaxRootAsync(cancellationToken);
-                if (root == null)
-                {
+                if (root == null) {
                     throw new McpException("Failed to get syntax root for the document");
                 }
 
@@ -520,8 +514,7 @@ public static class ModificationTools {
                     .OfType<MethodDeclarationSyntax>()
                     .FirstOrDefault(m => m.Identifier.Text == methodName);
 
-                if (methodNode == null)
-                {
+                if (methodNode == null) {
                     throw new McpException($"⚠️ Method '{methodName}' not found in file {filePath}");
                 }
 
@@ -530,8 +523,7 @@ public static class ModificationTools {
                     .SelectMany(al => al.Attributes)
                     .Any(a => a.Name.ToString().Contains("McpServerTool"));
 
-                if (!hasSharpToolAttribute)
-                {
+                if (!hasSharpToolAttribute) {
                     throw new McpException($"⚠️ Method '{methodName}' is not a SharpTool (missing [McpServerTool] attribute)");
                 }
 
@@ -539,13 +531,11 @@ public static class ModificationTools {
                 AttributeSyntax? existingDescription = null;
                 AttributeListSyntax? containingList = null;
 
-                foreach (var attrList in methodNode.AttributeLists)
-                {
+                foreach (var attrList in methodNode.AttributeLists) {
                     var descAttr = attrList.Attributes
                         .FirstOrDefault(a => a.Name.ToString() == "Description");
-                    
-                    if (descAttr != null)
-                    {
+
+                    if (descAttr != null) {
                         existingDescription = descAttr;
                         containingList = attrList;
                         break;
@@ -554,8 +544,7 @@ public static class ModificationTools {
 
                 SyntaxNode newRoot;
 
-                if (existingDescription != null)
-                {
+                if (existingDescription != null) {
                     // Update existing Description attribute
                     var newDescriptionAttr = SyntaxFactory.Attribute(
                         SyntaxFactory.IdentifierName("Description"),
@@ -572,9 +561,7 @@ public static class ModificationTools {
                     );
 
                     newRoot = root.ReplaceNode(existingDescription, newDescriptionAttr);
-                }
-                else
-                {
+                } else {
                     // Add new Description attribute
                     var newAttrList = SyntaxFactory.AttributeList(
                         SyntaxFactory.SingletonSeparatedList(
@@ -600,23 +587,20 @@ public static class ModificationTools {
 
                 var newDocument = document.WithSyntaxRoot(newRoot);
                 var formattedDocument = await modificationService.FormatDocumentAsync(newDocument, cancellationToken);
-                
-                if (!workspace.TryApplyChanges(formattedDocument.Project.Solution))
-                {
+
+                if (!workspace.TryApplyChanges(formattedDocument.Project.Solution)) {
                     throw new McpException("Failed to apply changes to the workspace");
                 }
 
                 return $"✅ Successfully updated Description attribute for method '{methodName}' in {filePath}";
-            }
-            finally
-            {
+            } finally {
                 workspace.Dispose();
             }
         }, logger, nameof(UpdateToolDescription), cancellationToken);
     }
 
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(OverwriteMember), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("Replaces the definition of an existing member with new C# code in a file. Works without a pre-loaded solution.")]
+    [Description("⚠️ 【破壊的変更】既存メンバーを完全に置き換えます。必ずGetMethodSignatureで現在の実装を確認してから実行してください。不完全なコードは実装を削除する危険があります")]
     public static async Task<string> OverwriteMember(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
@@ -633,7 +617,7 @@ public static class ModificationTools {
             newMemberCode = newMemberCode.TrimBackslash();
 
             if (!File.Exists(filePath)) {
-                throw new McpException($"File not found: {filePath}");
+                throw new McpException($"📁 ファイルが見つかりません: {filePath}\n💡 確認方法:\n• パスが正しいかを確認（絶対パス推奨）\n• {ToolHelpers.SharpToolPrefix}ReadTypesFromRoslynDocument で構造を確認");
             }
 
             logger.LogInformation("Executing '{OverwriteMember}' for: {MemberName} in {FilePath}",
@@ -738,9 +722,9 @@ public static class ModificationTools {
                             ? string.Join("\n", diagnostics.Select(d => $"- {d.GetMessage()}"))
                             : "<errorCheck>No compilation issues detected.</errorCheck>";
 
-                        return $"Successfully deleted symbol {fullyQualifiedMemberName}.\n\n{errorMessages}";
+                        return $"✅ シンボルを正常に削除しました {fullyQualifiedMemberName}.\n\n{errorMessages}";
                     }
-                    return $"Successfully deleted symbol {fullyQualifiedMemberName}";
+                    return $"✅ シンボルを正常に削除しました {fullyQualifiedMemberName}";
                 }
 
                 SyntaxNode? newNode;
@@ -748,12 +732,12 @@ public static class ModificationTools {
                     // PRE-PARSE VALIDATION: Check for syntax errors before processing
                     var syntaxTree = CSharpSyntaxTree.ParseText(newMemberCode);
                     var syntaxDiagnostics = syntaxTree.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
-                    
+
                     if (syntaxDiagnostics.Any()) {
                         var errorMessages = string.Join("\n", syntaxDiagnostics.Select(d => $"  - {d.GetMessage()}"));
                         throw new McpException($"Syntax errors in provided code:\n{errorMessages}");
                     }
-                    
+
                     var parsedCode = SyntaxFactory.ParseCompilationUnit(newMemberCode);
                     newNode = parsedCode.Members.FirstOrDefault();
 
@@ -772,20 +756,20 @@ public static class ModificationTools {
                     if (oldNode is MethodDeclarationSyntax oldMethod && newNode is MethodDeclarationSyntax newMethod) {
                         // First, check if the old method had a body
                         bool oldHasBody = oldMethod.Body != null || oldMethod.ExpressionBody != null;
-                        
+
                         // Check various indicators that the new method might be incomplete
                         bool newHasBody = newMethod.Body != null || newMethod.ExpressionBody != null;
                         bool newIsAbstract = newMethod.Modifiers.Any(m => m.IsKind(SyntaxKind.AbstractKeyword));
                         bool newIsPartial = newMethod.Modifiers.Any(m => m.IsKind(SyntaxKind.PartialKeyword));
                         bool newIsExtern = newMethod.Modifiers.Any(m => m.IsKind(SyntaxKind.ExternKeyword));
-                        
+
                         // Check if the method ends with a semicolon (could be abstract/interface/extern)
                         bool newEndsWithSemicolon = newMethod.SemicolonToken.IsKind(SyntaxKind.SemicolonToken);
-                        
+
                         // ADDITIONAL CHECK: Analyze the raw text to detect incomplete specifications
                         string newMethodText = newMethod.ToFullString().Trim();
                         bool looksIncomplete = false;
-                        
+
                         // Pattern detection for incomplete methods
                         if (!newHasBody && !newIsAbstract && !newIsPartial && !newIsExtern) {
                             // Check if it looks like just a signature (no braces at all)
@@ -854,10 +838,10 @@ public static class ModificationTools {
                         ? $"<errorCheck>Compilation errors detected:\n{string.Join("\n", diagnostics.Select(d => $"- {d.GetMessage()}"))}</errorCheck>"
                         : "<errorCheck>No compilation issues detected.</errorCheck>";
 
-                    return $"Successfully replaced symbol {fullyQualifiedMemberName}.\n\n{diffResult}\n\n{errorMessages}";
+                    return $"✅ シンボルを正常に置換しました {fullyQualifiedMemberName}.\n\n{diffResult}\n\n{errorMessages}";
                 }
 
-                return $"Successfully replaced symbol {fullyQualifiedMemberName}.\n\n{diffResult}";
+                return $"✅ シンボルを正常に置換しました {fullyQualifiedMemberName}.\n\n{diffResult}";
 
             } finally {
                 workspace.Dispose();
@@ -883,7 +867,7 @@ public static class ModificationTools {
             ErrorHandlingHelpers.ValidateStringParameter(newDescription, nameof(newDescription), logger);
 
             if (!File.Exists(filePath)) {
-                throw new McpException($"File not found: {filePath}");
+                throw new McpException($"📁 ファイルが見つかりません: {filePath}\n💡 確認方法:\n• パスが正しいかを確認（絶対パス推奨）\n• {ToolHelpers.SharpToolPrefix}ReadTypesFromRoslynDocument で構造を確認");
             }
 
             logger.LogInformation("Executing '{UpdateParameterDescription}' for parameter: {ParameterName} in method: {MethodName} in file: {FilePath}",
@@ -1008,7 +992,7 @@ public static class ModificationTools {
             ErrorHandlingHelpers.ValidateStringParameter(newName, "newName", logger);
 
             if (!File.Exists(filePath)) {
-                throw new McpException($"File not found: {filePath}");
+                throw new McpException($"📁 ファイルが見つかりません: {filePath}\n💡 確認方法:\n• パスが正しいかを確認（絶対パス推奨）\n• {ToolHelpers.SharpToolPrefix}ReadTypesFromRoslynDocument で構造を確認");
             }
 
             // Validate that the new name is a valid C# identifier
@@ -1116,7 +1100,7 @@ public static class ModificationTools {
             ErrorHandlingHelpers.ValidateStringParameter(regexPattern, "regexPattern", logger);
 
             if (!File.Exists(filePath)) {
-                throw new McpException($"File not found: {filePath}");
+                throw new McpException($"📁 ファイルが見つかりません: {filePath}\n💡 確認方法:\n• パスが正しいかを確認（絶対パス推奨）\n• {ToolHelpers.SharpToolPrefix}ReadTypesFromRoslynDocument で構造を確認");
             }
 
             // Create stateless document operations service with context directory
