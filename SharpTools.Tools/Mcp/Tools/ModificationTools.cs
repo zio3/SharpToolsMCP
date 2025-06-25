@@ -28,126 +28,6 @@ public class ModificationToolsLogCategory { }
 
 [McpServerToolType]
 public static class ModificationTools {
-    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(AddMember), Idempotent = false, Destructive = false, OpenWorld = false, ReadOnly = false)]
-    [Description("Adds one or more new member definitions (Property, Field, Method, inner Class, etc.) to a specified type. Code is parsed, inserted, and formatted. Definition can include xml documentation and attributes. Writing small components produces cleaner code, so you can use this to break up large components, in addition to adding new functionality.")]
-    public static async Task<string> AddMember(
-        ISolutionManager solutionManager,
-        ICodeModificationService modificationService,
-        IComplexityAnalysisService complexityAnalysisService,
-        ISemanticSimilarityService semanticSimilarityService,
-        ILogger<ModificationToolsLogCategory> logger,
-        [Description("FQN of the parent type or method.")] string fullyQualifiedTargetName,
-        [Description("The C# code to add.")] string codeSnippet,
-        [Description("If the target is a partial type, specifies which file to add to. Set to 'auto' to determine automatically.")] string fileNameHint,
-        [Description("Suggest a line number to insert the member near. '-1' to determine automatically.")] int lineNumberHint,
-        CancellationToken cancellationToken = default) {
-        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
-            // Validate parameters
-            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedTargetName, "fullyQualifiedTargetName", logger);
-            ErrorHandlingHelpers.ValidateStringParameter(codeSnippet, "codeSnippet", logger);
-            codeSnippet = codeSnippet.TrimBackslash();
-
-            // Ensure solution is loaded
-            ToolHelpers.EnsureSolutionLoadedWithDetails(solutionManager, logger, nameof(AddMember));
-            logger.LogInformation("Executing '{AddMember}' for target: {TargetName}", nameof(AddMember), fullyQualifiedTargetName);
-
-            // Get the target symbol
-            var targetSymbol = await ToolHelpers.GetRoslynSymbolOrThrowAsync(solutionManager, fullyQualifiedTargetName, cancellationToken);
-
-            SyntaxReference? targetSyntaxRef = null;
-            if (!string.IsNullOrEmpty(fileNameHint) && fileNameHint != "auto") {
-                targetSyntaxRef = targetSymbol.DeclaringSyntaxReferences.FirstOrDefault(sr =>
-                    sr.SyntaxTree.FilePath != null && sr.SyntaxTree.FilePath.Contains(fileNameHint));
-
-                if (targetSyntaxRef == null) {
-                    throw new McpException($"File hint '{fileNameHint}' did not match any declaring syntax reference for symbol '{fullyQualifiedTargetName}'.");
-                }
-            } else {
-                targetSyntaxRef = targetSymbol.DeclaringSyntaxReferences.FirstOrDefault();
-            }
-            if (targetSyntaxRef == null) {
-                throw new McpException($"Could not find a suitable syntax reference for symbol '{fullyQualifiedTargetName}'.");
-            }
-
-            if (solutionManager.CurrentSolution == null) {
-                throw new McpException("Current solution is unexpectedly null after validation checks.");
-            }
-
-            var syntaxNode = await targetSyntaxRef.GetSyntaxAsync(cancellationToken);
-            var document = ToolHelpers.GetDocumentFromSyntaxNodeOrThrow(solutionManager.CurrentSolution, syntaxNode);
-
-            if (targetSymbol is not INamedTypeSymbol typeSymbol) {
-                throw new McpException($"Target '{fullyQualifiedTargetName}' is not a type, cannot add member.");
-            }
-
-            // Parse the code snippet
-            MemberDeclarationSyntax? memberSyntax;
-            try {
-                memberSyntax = SyntaxFactory.ParseMemberDeclaration(codeSnippet);
-                if (memberSyntax == null) {
-                    throw new McpException("Failed to parse code snippet as a valid member declaration.");
-                }
-            } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
-                logger.LogError(ex, "Failed to parse code snippet as member declaration");
-                throw new McpException($"Invalid C# syntax in code snippet: {ex.Message}");
-            }
-
-            // Verify the member name doesn't already exist in the type
-            string memberName = GetMemberName(memberSyntax);
-            logger.LogInformation("Adding member with name: {MemberName}", memberName);
-
-            // Check for duplicate members
-            if (!IsMemberAllowed(typeSymbol, memberSyntax, memberName, cancellationToken)) {
-                throw new McpException($"A member with the name '{memberName}' already exists in '{fullyQualifiedTargetName}'" +
-                    (memberSyntax is MethodDeclarationSyntax ? " with the same parameter signature." : "."));
-            }
-
-            try {
-                // Use the lineNumberHint parameter when calling AddMemberAsync
-                var newSolution = await modificationService.AddMemberAsync(document.Id, typeSymbol, memberSyntax, lineNumberHint, cancellationToken);
-
-                await modificationService.ApplyChangesAsync(newSolution, cancellationToken);
-
-                // Check for compilation errors after adding the code
-                var updatedDocument = solutionManager.CurrentSolution.GetDocument(document.Id);
-                if (updatedDocument is null) {
-                    logger.LogError("Updated document for {TargetName} is null after applying changes", fullyQualifiedTargetName);
-                    throw new McpException($"Failed to retrieve updated document for {fullyQualifiedTargetName} after applying changes.");
-                }
-                var (hasErrors, errorMessages) = await ContextInjectors.CheckCompilationErrorsAsync(
-                    solutionManager, updatedDocument, logger, cancellationToken);
-
-                // Perform complexity and similarity analysis on the added member
-                string analysisResults = string.Empty;
-
-                // Get the updated type symbol to find the newly added member
-                var updatedSemanticModel = await updatedDocument.GetSemanticModelAsync(cancellationToken);
-                if (updatedSemanticModel != null) {
-                    // Find the type symbol in the updated document by FQN instead of using old syntax reference
-                    var updatedTypeSymbol = await ToolHelpers.GetRoslynSymbolOrThrowAsync(solutionManager, fullyQualifiedTargetName, cancellationToken) as INamedTypeSymbol;
-
-                    if (updatedTypeSymbol != null) {
-                        // Find the added member by name
-                        var addedSymbol = updatedTypeSymbol.GetMembers(memberName).FirstOrDefault();
-                        if (addedSymbol != null) {
-                            analysisResults = await MemberAnalysisHelper.AnalyzeAddedMemberAsync(
-                                addedSymbol, complexityAnalysisService, semanticSimilarityService, logger, cancellationToken);
-                        }
-                    }
-                }
-
-                string baseMessage = $"Successfully added member to {fullyQualifiedTargetName} in {document.FilePath ?? "unknown file"}.\n\n" +
-                    ((!hasErrors) ? "<errorCheck>No compilation issues detected.</errorCheck>" :
-                    ($"{errorMessages}\n" + //Code added is not necessary in Copilot, as it can see the invocation  $"\nCode added:\n{codeSnippet}\n\n" +
-                    $"If you choose to fix these issues, you must use {ToolHelpers.SharpToolPrefix + nameof(OverwriteMember)} to replace the member with a new definition."));
-
-                return string.IsNullOrWhiteSpace(analysisResults) ? baseMessage : $"{baseMessage}\n\n{analysisResults}";
-            } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
-                logger.LogError(ex, "Failed to add member to {TypeName}", fullyQualifiedTargetName);
-                throw new McpException($"Failed to add member to {fullyQualifiedTargetName}: {ex.Message}");
-            }
-        }, logger, nameof(AddMember), cancellationToken);
-    }
     private static string GetMemberName(MemberDeclarationSyntax memberSyntax) {
         return memberSyntax switch {
             MethodDeclarationSyntax method => method.Identifier.Text,
@@ -267,752 +147,12 @@ public static class ModificationTools {
 
         return string.Join(".", parts);
     }
-
-    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(OverwriteMember), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("Replaces the definition of an existing member or type with new C# code, or deletes it. Code is parsed and formatted. Code can contain multiple new members, update the existing member, and/or replace it with a new one.")]
-    public static async Task<string> OverwriteMember(
-        ISolutionManager solutionManager,
-        ICodeModificationService modificationService,
-        ILogger<ModificationToolsLogCategory> logger,
-        [Description("FQN of the member or type to rewrite.")] string fullyQualifiedMemberName,
-        [Description("The new C# code for the member or type. *If this member has attributes or XML documentation, they MUST be included here.* To Delete the target instead, set this to `// Delete {memberName}`.")] string newMemberCode,
-        CancellationToken cancellationToken = default) {
-        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
-            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedMemberName, nameof(fullyQualifiedMemberName), logger);
-            ErrorHandlingHelpers.ValidateStringParameter(newMemberCode, nameof(newMemberCode), logger);
-            newMemberCode = newMemberCode.TrimBackslash();
-
-            ToolHelpers.EnsureSolutionLoadedWithDetails(solutionManager, logger, nameof(OverwriteMember));
-            logger.LogInformation("Executing '{OverwriteMember}' for: {SymbolName}", nameof(OverwriteMember), fullyQualifiedMemberName);
-
-            var symbol = await ToolHelpers.GetRoslynSymbolOrThrowAsync(solutionManager, fullyQualifiedMemberName, cancellationToken);
-
-            if (!symbol.DeclaringSyntaxReferences.Any()) {
-                throw new McpException($"Symbol '{fullyQualifiedMemberName}' has no declaring syntax references.");
-            }
-
-            var syntaxRef = symbol.DeclaringSyntaxReferences.First();
-            var oldNode = await syntaxRef.GetSyntaxAsync(cancellationToken);
-
-            if (solutionManager.CurrentSolution is null) {
-                throw new McpException("Current solution is unexpectedly null after validation checks.");
-            }
-
-            var document = ToolHelpers.GetDocumentFromSyntaxNodeOrThrow(solutionManager.CurrentSolution, oldNode);
-
-            if (oldNode is not MemberDeclarationSyntax && oldNode is not TypeDeclarationSyntax) {
-                throw new McpException($"Symbol '{fullyQualifiedMemberName}' does not represent a replaceable member or type.");
-            }
-
-            // Get a simple name for the symbol for the commit message
-            string symbolName = symbol.Name;
-
-            bool isDelete = newMemberCode.StartsWith("// Delete", StringComparison.OrdinalIgnoreCase);
-            if (isDelete) {
-                var commentTrivia = SyntaxFactory.Comment(newMemberCode);
-                var emptyNode = SyntaxFactory.EmptyStatement()
-                    .WithLeadingTrivia(commentTrivia)
-                    .WithTrailingTrivia(SyntaxFactory.EndOfLine("\n"));
-
-                try {
-                    var newSolution = await modificationService.ReplaceNodeAsync(document.Id, oldNode, emptyNode, cancellationToken);
-                    await modificationService.ApplyChangesAsync(newSolution, cancellationToken);
-
-                    var updatedDocument = solutionManager.CurrentSolution.GetDocument(document.Id);
-                    if (updatedDocument != null) {
-                        var (hasErrors, errorMessages) = await ContextInjectors.CheckCompilationErrorsAsync(
-                            solutionManager, updatedDocument, logger, cancellationToken);
-                        if (!hasErrors)
-                            errorMessages = "<errorCheck>No compilation issues detected.</errorCheck>";
-
-                        return $"Successfully deleted symbol {fullyQualifiedMemberName}.\n\n{errorMessages}";
-                    }
-                    return $"Successfully deleted symbol {fullyQualifiedMemberName}";
-                } catch (Exception ex) when (ex is not McpException && ex is not OperationCanceledException) {
-                    logger.LogError(ex, "Failed to delete symbol {SymbolName}", fullyQualifiedMemberName);
-                    throw new McpException($"Failed to delete symbol {fullyQualifiedMemberName}: {ex.Message}");
-                }
-            }
-
-            SyntaxNode? newNode;
-            try {
-                var parsedCode = SyntaxFactory.ParseCompilationUnit(newMemberCode);
-                newNode = parsedCode.Members.FirstOrDefault();
-
-                if (newNode is null) {
-                    throw new McpException("Failed to parse new code as a valid member or type declaration. The parsed result was empty.");
-                }
-
-                // Validate that the parsed node is of an expected type if the original was a TypeDeclaration
-                if (oldNode is TypeDeclarationSyntax && newNode is not TypeDeclarationSyntax) {
-                    throw new McpException($"The new code for '{fullyQualifiedMemberName}' was parsed as a {newNode.Kind()}, but a TypeDeclaration was expected to replace the existing TypeDeclaration.");
-                }
-                // Validate that the parsed node is of an expected type if the original was a MemberDeclaration (but not a TypeDeclaration, which is a subtype)
-                else if (oldNode is MemberDeclarationSyntax && oldNode is not TypeDeclarationSyntax && newNode is not MemberDeclarationSyntax) {
-                    throw new McpException($"The new code for '{fullyQualifiedMemberName}' was parsed as a {newNode.Kind()}, but a MemberDeclaration was expected to replace the existing MemberDeclaration.");
-                }
-
-            } catch (Exception ex) when (ex is not McpException && ex is not OperationCanceledException) {
-                logger.LogError(ex, "Failed to parse replacement code for {SymbolName}", fullyQualifiedMemberName);
-                throw new McpException($"Invalid C# syntax in replacement code: {ex.Message}");
-            }
-
-            if (newNode is null) { // Should be caught by earlier checks, but as a safeguard.
-                throw new McpException("Critical error: Failed to parse new code and newNode is null.");
-            }
-
-            try {
-                var newSolution = await modificationService.ReplaceNodeAsync(document.Id, oldNode, newNode, cancellationToken);
-                await modificationService.ApplyChangesAsync(newSolution, cancellationToken);
-
-                if (solutionManager.CurrentSolution is null) {
-                    throw new McpException("Current solution is unexpectedly null after applying changes.");
-                }
-
-                // Generate diff using the centralized ContextInjectors
-                var diffResult = ContextInjectors.CreateCodeDiff(oldNode.ToFullString(), newNode.ToFullString());
-
-                var updatedDocument = solutionManager.CurrentSolution.GetDocument(document.Id);
-                if (updatedDocument is null) {
-                    logger.LogError("Updated document for {SymbolName} is null after applying changes", fullyQualifiedMemberName);
-                    throw new McpException($"Failed to retrieve updated document for {fullyQualifiedMemberName} after applying changes.");
-                }
-
-                var (hasErrors, errorMessages) = await ContextInjectors.CheckCompilationErrorsAsync(
-                    solutionManager, updatedDocument, logger, cancellationToken);
-                if (!hasErrors)
-                    errorMessages = "<errorCheck>No compilation issues detected.</errorCheck>";
-
-                return $"Successfully replaced symbol {fullyQualifiedMemberName}.\n\n{diffResult}\n\n{errorMessages}";
-
-
-            } catch (Exception ex) when (ex is not McpException && ex is not OperationCanceledException) {
-                logger.LogError(ex, "Failed to replace symbol {SymbolName}", fullyQualifiedMemberName);
-                throw new McpException($"Failed to replace symbol {fullyQualifiedMemberName}: {ex.Message}");
-            }
-        }, logger, nameof(OverwriteMember), cancellationToken);
-    }
-    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(RenameSymbol), Idempotent = true, Destructive = true, OpenWorld = false, ReadOnly = false),
-    Description("Renames a symbol (variable, method, property, type) and updates all references. Changes are formatted.")]
-    public static async Task<string> RenameSymbol(
-        ISolutionManager solutionManager,
-        ICodeModificationService modificationService,
-        ILogger<ModificationToolsLogCategory> logger,
-        [Description("FQN of the symbol to rename.")] string fullyQualifiedSymbolName,
-        [Description("The new name for the symbol.")] string newName,
-        CancellationToken cancellationToken = default) {
-
-        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
-            // Validate parameters
-            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedSymbolName, "fullyQualifiedSymbolName", logger);
-            ErrorHandlingHelpers.ValidateStringParameter(newName, "newName", logger);
-
-            // Validate that the new name is a valid C# identifier
-            if (!IsValidCSharpIdentifier(newName)) {
-                throw new McpException($"'{newName}' is not a valid C# identifier for renaming.");
-            }
-
-            // Ensure solution is loaded
-            ToolHelpers.EnsureSolutionLoadedWithDetails(solutionManager, logger, nameof(RenameSymbol));
-            logger.LogInformation("Executing '{RenameSymbol}' for {SymbolName} to {NewName}", nameof(RenameSymbol), fullyQualifiedSymbolName, newName);
-
-            // Get the symbol to rename
-            var symbol = await ToolHelpers.GetRoslynSymbolOrThrowAsync(solutionManager, fullyQualifiedSymbolName, cancellationToken);
-
-            // Check if symbol is renamable
-            if (symbol.IsImplicitlyDeclared) {
-                throw new McpException($"Cannot rename implicitly declared symbol '{fullyQualifiedSymbolName}'.");
-            }
-
-
-            try {
-                // Perform the rename operation
-                var newSolution = await modificationService.RenameSymbolAsync(symbol, newName, cancellationToken);
-
-                // Check if the operation actually made changes
-                var changeset = newSolution.GetChanges(solutionManager.CurrentSolution!);
-                var changedDocumentCount = changeset.GetProjectChanges().Sum(p => p.GetChangedDocuments().Count());
-
-                if (changedDocumentCount == 0) {
-                    logger.LogWarning("Rename operation for {SymbolName} to {NewName} produced no changes",
-                        fullyQualifiedSymbolName, newName);
-                }
-
-                // Apply the changes with the commit message
-                await modificationService.ApplyChangesAsync(newSolution, cancellationToken);
-
-                // Check for compilation errors after renaming the symbol using centralized ContextInjectors
-                // Get the first few affected documents to check
-                var affectedDocumentIds = changeset.GetProjectChanges()
-                    .SelectMany(pc => pc.GetChangedDocuments())
-                    .Take(5)  // Limit to first 5 documents to avoid excessive checking
-                    .ToList();
-
-                StringBuilder errorBuilder = new StringBuilder("<errorCheck>");
-
-                // Check each affected document for compilation errors
-                foreach (var docId in affectedDocumentIds) {
-                    if (solutionManager.CurrentSolution != null) {
-                        var updatedDoc = solutionManager.CurrentSolution.GetDocument(docId);
-                        if (updatedDoc != null) {
-                            var (docHasErrors, docErrorMessages) = await ContextInjectors.CheckCompilationErrorsAsync(
-                                solutionManager, updatedDoc, logger, cancellationToken);
-
-                            if (docHasErrors) {
-                                errorBuilder.AppendLine($"Issues in file {updatedDoc.FilePath ?? "unknown"}:");
-                                errorBuilder.AppendLine(docErrorMessages);
-                                errorBuilder.AppendLine();
-                            } else {
-                                errorBuilder.AppendLine($"No compilation issues in file {updatedDoc.FilePath ?? "unknown"}.");
-                            }
-                        }
-                    }
-                }
-                errorBuilder.AppendLine("</errorCheck>");
-
-                return $"Symbol '{symbol.Name}' (originally '{fullyQualifiedSymbolName}') successfully renamed to '{newName}' and references updated in {changedDocumentCount} documents.\n\n{errorBuilder}";
-
-            } catch (InvalidOperationException ex) {
-                logger.LogError(ex, "Invalid rename operation for {SymbolName} to {NewName}", fullyQualifiedSymbolName, newName);
-                throw new McpException($"Cannot rename symbol '{fullyQualifiedSymbolName}' to '{newName}': {ex.Message}");
-            } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
-                logger.LogError(ex, "Failed to rename symbol {SymbolName} to {NewName}", fullyQualifiedSymbolName, newName);
-                throw new McpException($"Failed to rename symbol '{fullyQualifiedSymbolName}' to '{newName}': {ex.Message}");
-            }
-        }, logger, nameof(RenameSymbol), cancellationToken);
-    }
     // Helper method to check if a string is a valid C# identifier
     private static bool IsValidCSharpIdentifier(string name) {
         return SyntaxFacts.IsValidIdentifier(name);
     }
 
-    //Disabled for now
-    //[McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(ReplaceAllReferences), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("Surgically replaces all references to a symbol with new C# code across the solution. Perfect for systematic API upgrades - e.g., replacing all Console.WriteLine() calls with Logger.Info(). Use filename filters (*.cs, Controller*.cs) to scope changes to specific files.")]
-    public static async Task<string> ReplaceAllReferences(
-        ISolutionManager solutionManager,
-        ICodeModificationService modificationService,
-        ILogger<ModificationToolsLogCategory> logger,
-        [Description("FQN of the symbol whose references should be replaced.")] string fullyQualifiedSymbolName,
-        [Description("The C# code replace references with.")] string replacementCode,
-        [Description("Only replace symbols in files with this pattern. Supports globbing (`*`).")] string filenameFilter,
-        CancellationToken cancellationToken = default) {
-
-        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
-            // Validate parameters
-            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedSymbolName, "fullyQualifiedSymbolName", logger);
-            ErrorHandlingHelpers.ValidateStringParameter(replacementCode, "replacementCode", logger);
-            replacementCode = replacementCode.TrimBackslash();
-
-            // Note: filenameFilter can be empty or null, as this indicates "replace in all files"
-
-            // Ensure solution is loaded
-            ToolHelpers.EnsureSolutionLoadedWithDetails(solutionManager, logger, nameof(ReplaceAllReferences));
-            logger.LogInformation("Executing '{ReplaceAllReferences}' for {SymbolName} with text '{ReplacementCode}', filter: {Filter}",
-                nameof(ReplaceAllReferences), fullyQualifiedSymbolName, replacementCode, filenameFilter ?? "none");
-
-            // Get the symbol whose references will be replaced
-            var symbol = await ToolHelpers.GetRoslynSymbolOrThrowAsync(solutionManager, fullyQualifiedSymbolName, cancellationToken);
-
-            // Create a shortened version of the replacement code for the commit message
-            string shortReplacementCode = replacementCode.Length > 30
-                ? replacementCode.Substring(0, 30) + "..."
-                : replacementCode;
-
-
-            // Validate that the replacement code can be parsed as a valid C# expression
-            try {
-                var expressionSyntax = SyntaxFactory.ParseExpression(replacementCode);
-                if (expressionSyntax == null) {
-                    logger.LogWarning("Replacement code '{ReplacementCode}' may not be a valid C# expression", replacementCode);
-                }
-            } catch (Exception ex) {
-                logger.LogWarning(ex, "Replacement code '{ReplacementCode}' could not be parsed as a C# expression", replacementCode);
-                // We don't throw here, because some valid replacements might not be valid expressions on their own
-            }
-
-            // Create a predicate filter if a filename filter is provided
-            Func<SyntaxNode, bool>? predicateFilter = null;
-            if (!string.IsNullOrEmpty(filenameFilter)) {
-                Matcher matcher = new(StringComparison.OrdinalIgnoreCase);
-                string normalizedFilter = filenameFilter.Replace('\\', '/');
-                matcher.AddInclude(normalizedFilter);
-
-                string root = Path.GetPathRoot(solutionManager.CurrentSolution?.FilePath) ?? Path.GetPathRoot(Environment.CurrentDirectory)!;
-                try {
-                    predicateFilter = node => {
-                        try {
-                            var location = node.GetLocation();
-                            if (location == null || string.IsNullOrWhiteSpace(location.SourceTree?.FilePath)) {
-                                return false;
-                            }
-                            string filePath = location.SourceTree.FilePath;
-                            return matcher.Match(root, filePath).HasMatches;
-                        } catch (Exception ex) {
-                            logger.LogWarning(ex, "Error applying filename filter to node");
-                            return false; // Skip nodes that cause errors in the filter
-                        }
-                    };
-                } catch (Exception ex) {
-                    logger.LogError(ex, "Failed to create filename filter '{Filter}'", filenameFilter);
-                    throw new McpException($"Failed to create filename filter '{filenameFilter}': {ex.Message}");
-                }
-            }
-
-            try {
-                // Replace all references to the symbol with the new code
-                var newSolution = await modificationService.ReplaceAllReferencesAsync(
-                    symbol, replacementCode, cancellationToken, predicateFilter);
-
-                // Count changes before applying them
-                if (solutionManager.CurrentSolution == null) {
-                    throw new McpException("Current solution is null after replacement operation.");
-                }
-
-                var originalSolution = solutionManager.CurrentSolution;
-                var solutionChanges = newSolution.GetChanges(originalSolution);
-                var changedDocumentsCount = solutionChanges.GetProjectChanges()
-                    .SelectMany(pc => pc.GetChangedDocuments())
-                    .Count();
-
-                if (changedDocumentsCount == 0) {
-                    logger.LogWarning("No documents were changed when replacing references to '{SymbolName}'",
-                        fullyQualifiedSymbolName);
-
-                    // We can't directly check for references without applying changes
-                    // Just give a general message about no changes being made
-
-                    if (!string.IsNullOrEmpty(filenameFilter)) {
-                        // If the filter is limiting results
-                        return $"No references to '{symbol.Name}' found in files matching '{filenameFilter}'. No changes were made.";
-                    } else {
-                        // General message about no changes
-                        return $"References to '{symbol.Name}' were found but no changes were made. The replacement code might be identical to the original.";
-                    }
-                }
-
-                // Apply the changes
-                await modificationService.ApplyChangesAsync(newSolution, cancellationToken);
-
-                // Check for compilation errors in changed documents
-                var changedDocIds = solutionChanges.GetProjectChanges()
-                    .SelectMany(pc => pc.GetChangedDocuments())
-                    .Take(5) // Limit to first 5 documents to avoid excessive checking
-                    .ToList();
-
-                StringBuilder errorBuilder = new StringBuilder("<errorCheck>");
-
-                // Check each affected document for compilation errors
-                foreach (var docId in changedDocIds) {
-                    if (solutionManager.CurrentSolution != null) {
-                        var updatedDoc = solutionManager.CurrentSolution.GetDocument(docId);
-                        if (updatedDoc != null) {
-                            var (docHasErrors, docErrorMessages) = await ContextInjectors.CheckCompilationErrorsAsync(
-                solutionManager, updatedDoc, logger, cancellationToken);
-
-                            if (docHasErrors) {
-                                errorBuilder.AppendLine($"Issues in file {updatedDoc.FilePath ?? "unknown"}:");
-                                errorBuilder.AppendLine(docErrorMessages);
-                                errorBuilder.AppendLine();
-                            } else {
-                                errorBuilder.AppendLine($"No compilation issues in file {updatedDoc.FilePath ?? "unknown"}.");
-                            }
-                        }
-                    }
-                }
-                errorBuilder.AppendLine("</errorCheck>");
-
-                var filterMessage = string.IsNullOrEmpty(filenameFilter) ? "" : $" (with filter '{filenameFilter}')";
-
-                return $"Successfully replaced references to '{symbol.Name}'{filterMessage} with '{replacementCode}' in {changedDocumentsCount} document(s).\n\n{errorBuilder}";
-
-            } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
-                logger.LogError(ex, "Failed to replace references to symbol '{SymbolName}' with '{ReplacementCode}'",
-                    fullyQualifiedSymbolName, replacementCode);
-                throw new McpException($"Failed to replace references: {ex.Message}");
-            }
-        }, logger, nameof(ReplaceAllReferences), cancellationToken);
-    }
-    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(FindAndReplace), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("Every developer's favorite. Use this for all small edits (code tweaks, usings, namespaces, interface implementations, attributes, etc.) instead of rewriting large members or types.")]
-    public static async Task<string> FindAndReplace(
-        ISolutionManager solutionManager,
-        ICodeModificationService modificationService,
-        IDocumentOperationsService documentOperations,
-        ILogger<ModificationToolsLogCategory> logger,
-        [Description("Regex operating in multiline mode, so `^` and `$` match per line. Always use `\\s*` at the beginnings of lines for unknown indentation. Make sure to escape your escapes for json.")] string regexPattern,
-        [Description("Replacement text, which can include regex groups ($1, ${name}, etc.)")] string replacementText,
-        [Description("Target, which can be either a FQN (replaces text within a declaration) or a filepath supporting globbing (`*`) (replaces all instances across files)")] string target,
-        CancellationToken cancellationToken = default) {
-
-        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
-            // Validate parameters
-            ErrorHandlingHelpers.ValidateStringParameter(regexPattern, "regexPattern", logger);
-            ErrorHandlingHelpers.ValidateStringParameter(target, "targetString", logger);
-
-            //normalize newlines in pattern
-            regexPattern = regexPattern
-            .Replace("\r\n", "\n")
-            .Replace("\r", "\n")
-            .Replace("\n", @"\n")
-            .Replace(@"\r\n", @"\n")
-            .Replace(@"\r", @"\n");
-
-            // Ensure solution is loaded
-            ToolHelpers.EnsureSolutionLoadedWithDetails(solutionManager, logger, nameof(FindAndReplace));
-            logger.LogInformation("Executing '{FindAndReplace}' with pattern: '{Pattern}', replacement: {Replacement}, target: {Target}",
-                nameof(FindAndReplace), regexPattern, replacementText, target);
-
-            // Validate the regex pattern
-            try {
-                // Create the regex with multiline option to test it
-                _ = new Regex(regexPattern, RegexOptions.Multiline);
-            } catch (ArgumentException ex) {
-                throw new McpException($"Invalid regular expression pattern: {ex.Message}");
-            }
-
-            try {
-                // Get the original solution for later comparison
-                var originalSolution = solutionManager.CurrentSolution ?? throw new McpException("Current solution is null before find and replace operation.");
-
-                // Track all modified files for both code and non-code files
-                var modifiedFiles = new List<string>();
-                var changedDocuments = new List<DocumentId>();
-                var nonCodeFilesModified = new List<string>();
-                var nonCodeDiffs = new Dictionary<string, string>();
-
-                // First, check if the target is a file path pattern (contains wildcard or is a direct file path)
-                if (target.Contains("*") || target.Contains("?") || (File.Exists(target) && !documentOperations.IsCodeFile(target))) {
-                    logger.LogInformation("Target appears to be a file path pattern or non-code file: {Target}", target);
-
-                    // Normalize the target path to use forward slashes consistently
-                    string normalizedTarget = target.Replace('\\', '/');
-
-                    // Create matcher for the pattern
-                    Matcher matcher = new(StringComparison.OrdinalIgnoreCase);
-                    matcher.AddInclude(normalizedTarget);
-
-                    string root = Path.GetPathRoot(originalSolution.FilePath) ?? Path.GetPathRoot(Environment.CurrentDirectory)!;
-
-                    // Get all files in solution directory matching the pattern
-                    var solutionDirectory = Path.GetDirectoryName(originalSolution.FilePath);
-                    if (string.IsNullOrEmpty(solutionDirectory)) {
-                        throw new McpException("Could not determine solution directory");
-                    }
-
-                    // Handle direct file path (no wildcards)
-                    if (!target.Contains("*") && !target.Contains("?") && File.Exists(target)) {
-                        // Direct file path, process just this file
-                        var pathInfo = documentOperations.GetPathInfo(target);
-
-                        if (!pathInfo.IsWithinSolutionDirectory) {
-                            throw new McpException($"File {target} exists but is outside the solution directory. Cannot modify for safety reasons.");
-                        }
-
-                        // Check if it's a non-code file
-                        if (!documentOperations.IsCodeFile(target)) {
-                            var (changed, diff) = await ProcessNonCodeFile(target, regexPattern, replacementText, documentOperations, nonCodeFilesModified, cancellationToken);
-                            if (changed) {
-                                nonCodeDiffs.Add(target, diff);
-                            }
-                        }
-                    } else {
-                        // Use glob pattern to find matching files
-                        DirectoryInfo dirInfo = new DirectoryInfo(solutionDirectory);
-                        List<FileInfo> allFiles = dirInfo.GetFiles("*.*", SearchOption.AllDirectories).ToList();
-                        string rootDir = Path.GetPathRoot(solutionDirectory) ?? Path.GetPathRoot(Environment.CurrentDirectory)!;
-                        foreach (var file in allFiles) {
-                            if (matcher.Match(rootDir, file.FullName).HasMatches) {
-                                var pathInfo = documentOperations.GetPathInfo(file.FullName);
-
-                                // Skip files in unsafe directories or outside solution
-                                if (!pathInfo.IsWithinSolutionDirectory || !string.IsNullOrEmpty(pathInfo.WriteRestrictionReason)) {
-                                    logger.LogWarning("Skipping file due to restrictions: {FilePath}, Reason: {Reason}",
-                                        file.FullName, pathInfo.WriteRestrictionReason ?? "Outside solution directory");
-                                    continue;
-                                }
-
-                                // Process non-code files directly
-                                if (!documentOperations.IsCodeFile(file.FullName)) {
-                                    var (changed, diff) = await ProcessNonCodeFile(file.FullName, regexPattern, replacementText, documentOperations, nonCodeFilesModified, cancellationToken);
-                                    if (changed) {
-                                        nonCodeDiffs.Add(file.FullName, diff);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Now process code files through the Roslyn workspace
-                var newSolution = await modificationService.FindAndReplaceAsync(
-                    target, regexPattern, replacementText, cancellationToken, RegexOptions.Multiline);
-
-                // Get changed code documents
-                var solutionChanges = newSolution.GetChanges(originalSolution);
-                foreach (var projectChange in solutionChanges.GetProjectChanges()) {
-                    changedDocuments.AddRange(projectChange.GetChangedDocuments());
-                }
-
-                // If no code or non-code files were modified, return early
-                if (changedDocuments.Count == 0 && nonCodeFilesModified.Count == 0) {
-                    logger.LogWarning("No documents were changed during find and replace operation");
-                    throw new McpException($"No matches found for pattern '{regexPattern}' in target '{target}', or matches were found but replacement produced identical text. No changes were made.");
-                }
-
-                // Add code document file paths to the modifiedFiles list
-                foreach (var docId in changedDocuments) {
-                    var document = originalSolution.GetDocument(docId);
-                    if (document?.FilePath != null) {
-                        modifiedFiles.Add(document.FilePath);
-                    }
-                }
-
-                // Add non-code files to the list
-                modifiedFiles.AddRange(nonCodeFilesModified);
-
-
-                // Apply the changes to code files
-                if (changedDocuments.Count > 0) {
-                    await modificationService.ApplyChangesAsync(newSolution, cancellationToken);
-                }
-
-
-                // Check for compilation errors in changed code documents
-                var changedDocIds = changedDocuments.Take(5).ToList(); // Limit to first 5 documents
-                StringBuilder errorBuilder = new StringBuilder("<errorCheck>");
-
-                // Check each affected document for compilation errors
-                foreach (var docId in changedDocIds) {
-                    if (solutionManager.CurrentSolution != null) {
-                        var updatedDoc = solutionManager.CurrentSolution.GetDocument(docId);
-                        if (updatedDoc != null) {
-                            var (docHasErrors, docErrorMessages) = await ContextInjectors.CheckCompilationErrorsAsync(
-                                solutionManager, updatedDoc, logger, cancellationToken);
-
-                            if (docHasErrors) {
-                                errorBuilder.AppendLine($"Issues in file {updatedDoc.FilePath ?? "unknown"}:");
-                                errorBuilder.AppendLine(docErrorMessages);
-                                errorBuilder.AppendLine();
-                            } else {
-                                errorBuilder.AppendLine($"No compilation issues in file {updatedDoc.FilePath ?? "unknown"}.");
-                            }
-                        }
-                    }
-                }
-                errorBuilder.AppendLine("</errorCheck>");
-
-                // Generate multi-document diff for code files
-                string diffOutput = changedDocuments.Count > 0
-                    ? await ContextInjectors.CreateMultiDocumentDiff(
-                        originalSolution,
-                        newSolution,
-                        changedDocuments,
-                        5,
-                        cancellationToken)
-                    : "";
-
-                // For non-code files, build a similar diff output format
-                StringBuilder nonCodeDiffBuilder = new StringBuilder();
-                if (nonCodeDiffs.Count > 0) {
-                    nonCodeDiffBuilder.AppendLine();
-                    nonCodeDiffBuilder.AppendLine("Non-code file changes:");
-
-                    int nonCodeFileCount = 0;
-                    foreach (var diffEntry in nonCodeDiffs) {
-                        if (nonCodeFileCount >= 5) {
-                            nonCodeDiffBuilder.AppendLine($"...and {nonCodeDiffs.Count - 5} more non-code files");
-                            break;
-                        }
-                        nonCodeDiffBuilder.AppendLine();
-                        nonCodeDiffBuilder.AppendLine($"Document: {diffEntry.Key}");
-                        nonCodeDiffBuilder.AppendLine(diffEntry.Value);
-                        nonCodeFileCount++;
-                    }
-                }
-
-                return $"Successfully replaced pattern '{regexPattern}' with '{replacementText}' in {modifiedFiles.Count} file(s).\n\n{errorBuilder}\n\n{diffOutput}{nonCodeDiffBuilder}";
-
-            } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
-                logger.LogError(ex, "Failed to replace pattern '{Pattern}' with '{Replacement}' in '{Target}'",
-                    regexPattern, replacementText, target);
-                throw new McpException($"Failed to perform find and replace: {ex.Message}");
-            }
-        }, logger, nameof(FindAndReplace), cancellationToken);
-    }
-    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(MoveMember), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("Moves a member (property, field, method, nested type, etc.) from one type/namespace to another. The member is removed from the source location and added to the destination.")]
-    public static async Task<string> MoveMember(
-                        ISolutionManager solutionManager,
-                        ICodeModificationService modificationService,
-                        ILogger<ModificationToolsLogCategory> logger,
-                        [Description("FQN of the member to move.")] string fullyQualifiedMemberName,
-                        [Description("FQN of the destination type or namespace where the member should be moved.")] string fullyQualifiedDestinationTypeOrNamespaceName,
-                                        CancellationToken cancellationToken = default) {
-        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
-            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedMemberName, nameof(fullyQualifiedMemberName), logger);
-            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedDestinationTypeOrNamespaceName, nameof(fullyQualifiedDestinationTypeOrNamespaceName), logger);
-
-            ToolHelpers.EnsureSolutionLoadedWithDetails(solutionManager, logger, nameof(MoveMember));
-            logger.LogInformation("Executing '{MoveMember}' moving {MemberName} to {DestinationName}",
-                nameof(MoveMember), fullyQualifiedMemberName, fullyQualifiedDestinationTypeOrNamespaceName);
-
-            if (solutionManager.CurrentSolution == null) {
-                throw new McpException("Current solution is unexpectedly null after validation checks.");
-            }
-            Solution currentSolution = solutionManager.CurrentSolution;
-
-            var sourceMemberSymbol = await ToolHelpers.GetRoslynSymbolOrThrowAsync(solutionManager, fullyQualifiedMemberName, cancellationToken);
-
-            if (sourceMemberSymbol is not (IFieldSymbol or IPropertySymbol or IMethodSymbol or IEventSymbol or INamedTypeSymbol { TypeKind: TypeKind.Class or TypeKind.Struct or TypeKind.Interface or TypeKind.Enum or TypeKind.Delegate })) {
-                throw new McpException($"Symbol '{fullyQualifiedMemberName}' is not a movable member type. Only fields, properties, methods, events, and nested types can be moved.");
-            }
-
-            var destinationSymbol = await ToolHelpers.GetRoslynSymbolOrThrowAsync(solutionManager, fullyQualifiedDestinationTypeOrNamespaceName, cancellationToken);
-
-            if (destinationSymbol is not (INamedTypeSymbol or INamespaceSymbol)) {
-                throw new McpException($"Destination '{fullyQualifiedDestinationTypeOrNamespaceName}' must be a type or namespace.");
-            }
-
-            var sourceSyntaxRef = sourceMemberSymbol.DeclaringSyntaxReferences.FirstOrDefault();
-            if (sourceSyntaxRef == null) {
-                throw new McpException($"Could not find syntax reference for member '{fullyQualifiedMemberName}'.");
-            }
-
-            var sourceMemberNode = await sourceSyntaxRef.GetSyntaxAsync(cancellationToken);
-            if (sourceMemberNode is not MemberDeclarationSyntax memberDeclaration) {
-                throw new McpException($"Source member '{fullyQualifiedMemberName}' is not a valid member declaration.");
-            }
-
-            Document sourceDocument = ToolHelpers.GetDocumentFromSyntaxNodeOrThrow(currentSolution, sourceMemberNode);
-            Document destinationDocument;
-            INamedTypeSymbol? destinationTypeSymbol = null;
-            INamespaceSymbol? destinationNamespaceSymbol = null;
-
-            if (destinationSymbol is INamedTypeSymbol typeSym) {
-                destinationTypeSymbol = typeSym;
-                var destSyntaxRef = typeSym.DeclaringSyntaxReferences.FirstOrDefault();
-                if (destSyntaxRef == null) {
-                    throw new McpException($"Could not find syntax reference for destination type '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
-                }
-                var destNode = await destSyntaxRef.GetSyntaxAsync(cancellationToken);
-                destinationDocument = ToolHelpers.GetDocumentFromSyntaxNodeOrThrow(currentSolution, destNode);
-            } else if (destinationSymbol is INamespaceSymbol nsSym) {
-                destinationNamespaceSymbol = nsSym;
-                var projectForDestination = currentSolution.GetDocument(sourceDocument.Id)!.Project;
-                var existingDoc = await FindExistingDocumentWithNamespaceAsync(projectForDestination, nsSym, cancellationToken);
-                if (existingDoc != null) {
-                    destinationDocument = existingDoc;
-                } else {
-                    var newDoc = await CreateDocumentForNamespaceAsync(projectForDestination, nsSym, cancellationToken);
-                    destinationDocument = newDoc;
-                    currentSolution = newDoc.Project.Solution; // Update currentSolution after adding a document
-                }
-            } else {
-                throw new McpException("Invalid destination symbol type.");
-            }
-
-            if (sourceDocument.Id == destinationDocument.Id && sourceMemberSymbol.ContainingSymbol.Equals(destinationSymbol, SymbolEqualityComparer.Default)) {
-                throw new McpException($"Source and destination are the same. Member '{fullyQualifiedMemberName}' is already in '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
-            }
-
-            string memberName = GetMemberName(memberDeclaration);
-            INamedTypeSymbol? updatedDestinationTypeSymbol = null;
-            if (destinationTypeSymbol != null) {
-                // Re-resolve destinationTypeSymbol from the potentially updated currentSolution
-                var destinationDocumentFromCurrentSolution = currentSolution.GetDocument(destinationDocument.Id)
-                    ?? throw new McpException($"Destination document '{destinationDocument.FilePath}' not found in current solution for symbol re-resolution.");
-                var tempDestSymbol = await SymbolFinder.FindSymbolAtPositionAsync(destinationDocumentFromCurrentSolution, destinationTypeSymbol.Locations.First().SourceSpan.Start, cancellationToken);
-                updatedDestinationTypeSymbol = tempDestSymbol as INamedTypeSymbol;
-                if (updatedDestinationTypeSymbol == null) {
-                    throw new McpException($"Could not re-resolve destination type symbol '{destinationTypeSymbol.ToDisplayString()}' in the current solution state at file '{destinationDocumentFromCurrentSolution.FilePath}'. Original location span: {destinationTypeSymbol.Locations.First().SourceSpan}");
-                }
-            }
-
-            if (updatedDestinationTypeSymbol != null && !IsMemberAllowed(updatedDestinationTypeSymbol, memberDeclaration, memberName, cancellationToken)) {
-                throw new McpException($"A member with the name '{memberName}' already exists in destination type '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
-            }
-
-            try {
-                var actualDestinationDocument = currentSolution.GetDocument(destinationDocument.Id)
-                    ?? throw new McpException($"Destination document '{destinationDocument.FilePath}' not found in current solution before adding member.");
-
-                if (updatedDestinationTypeSymbol != null) {
-                    currentSolution = await modificationService.AddMemberAsync(actualDestinationDocument.Id, updatedDestinationTypeSymbol, memberDeclaration, -1, cancellationToken);
-                } else {
-                    if (destinationNamespaceSymbol == null) throw new McpException("Destination namespace symbol is null when expected for namespace move.");
-                    currentSolution = await AddMemberToNamespaceAsync(actualDestinationDocument, destinationNamespaceSymbol, memberDeclaration, modificationService, cancellationToken);
-                }
-
-                // Re-acquire source document and node from the *new* currentSolution
-                var sourceDocumentInCurrentSolution = currentSolution.GetDocument(sourceDocument.Id)
-                    ?? throw new McpException("Source document not found in current solution after adding member to destination.");
-                var syntaxRootOfSourceInCurrentSolution = await sourceDocumentInCurrentSolution.GetSyntaxRootAsync(cancellationToken)
-                    ?? throw new McpException("Could not get syntax root for source document in current solution.");
-
-                // Attempt to find the node again. Its span might have changed if the destination was in the same file.
-                var sourceMemberNodeInCurrentTree = syntaxRootOfSourceInCurrentSolution.FindNode(sourceMemberNode.Span, findInsideTrivia: true, getInnermostNodeForTie: true);
-                if (sourceMemberNodeInCurrentTree == null || !(sourceMemberNodeInCurrentTree is MemberDeclarationSyntax)) {
-                    // Fallback: Try to find by kind and name if span-based lookup failed (e.g. due to formatting changes or other modifications)
-                    sourceMemberNodeInCurrentTree = syntaxRootOfSourceInCurrentSolution
-                        .DescendantNodes()
-                        .OfType<MemberDeclarationSyntax>()
-                        .FirstOrDefault(m => m.Kind() == memberDeclaration.Kind() && GetMemberName(m) == memberName);
-
-                    if (sourceMemberNodeInCurrentTree == null) {
-                        logger.LogWarning("Could not precisely re-locate source member node by original span or by kind/name after destination add. Original span: {Span}. Member kind: {Kind}, Name: {Name}. File: {File}", sourceMemberNode.Span, memberDeclaration.Kind(), memberName, sourceDocumentInCurrentSolution.FilePath);
-                        // As a last resort, if the original node is still part of the new tree (by reference), use it.
-                        // This is risky if the tree has been significantly changed, but better than failing if it's just minor formatting.
-                        if (syntaxRootOfSourceInCurrentSolution.DescendantNodes().Contains(sourceMemberNode)) {
-                            sourceMemberNodeInCurrentTree = sourceMemberNode;
-                            logger.LogWarning("Fallback: Using original source member node reference for removal. This might be risky if tree changed significantly.");
-                        } else {
-                            throw new McpException($"Critically failed to re-locate source member node '{memberName}' in '{sourceDocumentInCurrentSolution.FilePath}' for removal after modifications. Original span {sourceMemberNode.Span}. This usually indicates significant tree changes that broke span tracking or the member was unexpectedly altered or removed.");
-                        }
-                    } else {
-                        logger.LogInformation("Re-located source member node by kind and name for removal. Original span: {OriginalSpan}, New span: {NewSpan}", sourceMemberNode.Span, sourceMemberNodeInCurrentTree.Span);
-                    }
-                }
-
-                currentSolution = await RemoveMemberFromParentAsync(sourceDocumentInCurrentSolution, sourceMemberNodeInCurrentTree, modificationService, cancellationToken);
-
-                await modificationService.ApplyChangesAsync(currentSolution, cancellationToken);
-
-                // After ApplyChangesAsync, the solutionManager.CurrentSolution should be the most up-to-date.
-                // Re-fetch documents from there for final error checking.
-                var finalSourceDocumentAfterApply = solutionManager.CurrentSolution?.GetDocument(sourceDocument.Id);
-                var finalDestinationDocumentAfterApply = solutionManager.CurrentSolution?.GetDocument(destinationDocument.Id);
-
-                StringBuilder errorBuilder = new StringBuilder("<errorCheck>");
-                if (finalSourceDocumentAfterApply != null) {
-                    var (sourceHasErrors, sourceErrorMessages) = await ContextInjectors.CheckCompilationErrorsAsync(solutionManager, finalSourceDocumentAfterApply, logger, cancellationToken);
-                    errorBuilder.AppendLine(sourceHasErrors
-                        ? $"Issues in source file {finalSourceDocumentAfterApply.FilePath ?? "unknown"}:\n{sourceErrorMessages}\n"
-                        : $"No compilation errors detected in source file {finalSourceDocumentAfterApply.FilePath ?? "unknown"}.");
-                }
-
-                if (finalDestinationDocumentAfterApply != null && (!finalSourceDocumentAfterApply?.Id.Equals(finalDestinationDocumentAfterApply.Id) ?? true)) {
-                    var (destHasErrors, destErrorMessages) = await ContextInjectors.CheckCompilationErrorsAsync(solutionManager, finalDestinationDocumentAfterApply, logger, cancellationToken);
-                    errorBuilder.AppendLine(destHasErrors
-                        ? $"Issues in destination file {finalDestinationDocumentAfterApply.FilePath ?? "unknown"}:\n{destErrorMessages}\n"
-                        : $"No compilation errors detected in destination file {finalDestinationDocumentAfterApply.FilePath ?? "unknown"}.");
-                }
-                errorBuilder.AppendLine("</errorCheck>");
-
-                var sourceFilePathDisplay = finalSourceDocumentAfterApply?.FilePath ?? sourceDocument.FilePath ?? "unknown source file";
-                var destinationFilePathDisplay = finalDestinationDocumentAfterApply?.FilePath ?? destinationDocument.FilePath ?? "unknown destination file";
-
-                var locationInfo = sourceFilePathDisplay == destinationFilePathDisplay
-                    ? $"within {sourceFilePathDisplay}"
-                    : $"from {sourceFilePathDisplay} to {destinationFilePathDisplay}";
-
-                return $"Successfully moved member '{memberName}' to '{fullyQualifiedDestinationTypeOrNamespaceName}' {locationInfo}.\n\n{errorBuilder}";
-            } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
-                logger.LogError(ex, "Failed to move member {MemberName} to {DestinationName}", fullyQualifiedMemberName, fullyQualifiedDestinationTypeOrNamespaceName);
-                throw new McpException($"Failed to move member '{fullyQualifiedMemberName}' to '{fullyQualifiedDestinationTypeOrNamespaceName}': {ex.Message}", ex);
-            }
-        }, logger, nameof(MoveMember), cancellationToken);
-    }
+    // Legacy stateful MoveMember has been removed - use the stateless version in #region Main Methods
     /// <summary>
     /// Finds an existing document in the project that contains the specified namespace.
     /// </summary>
@@ -1171,11 +311,11 @@ public static class ModificationTools {
         }
     }
 
-    #region Stateless Methods
+    #region Main Methods
 
-    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(AddMember_Stateless), Idempotent = false, Destructive = false, OpenWorld = false, ReadOnly = false)]
-    [Description("Stateless version of AddMember. Adds one or more new member definitions to a specified type in a file. Works without a pre-loaded solution.")]
-    public static async Task<string> AddMember_Stateless(
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(AddMember), Idempotent = false, Destructive = false, OpenWorld = false, ReadOnly = false)]
+    [Description("Adds one or more new member definitions to a specified type in a file. Works without a pre-loaded solution.")]
+    public static async Task<string> AddMember(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
         ICodeAnalysisService codeAnalysisService,
@@ -1197,7 +337,7 @@ public static class ModificationTools {
                 throw new McpException($"File not found: {filePath}");
             }
 
-            logger.LogInformation("Executing '{AddMember_Stateless}' for file: {FilePath}", nameof(AddMember_Stateless), filePath);
+            logger.LogInformation("Executing '{AddMember}' for file: {FilePath}", nameof(AddMember), filePath);
 
             // Create a workspace for the file
             var (workspace, project, document) = await workspaceFactory.CreateForFileAsync(filePath);
@@ -1326,18 +466,158 @@ public static class ModificationTools {
                 string baseMessage = $"Successfully added member to {targetTypeSymbol.ToDisplayString()} in {filePath}.\n\n" +
                     (string.IsNullOrEmpty(errorMessages) ? "<errorCheck>No compilation issues detected.</errorCheck>" :
                     ($"<errorCheck>Compilation errors detected:\n{errorMessages}</errorCheck>\n\n" +
-                    $"If you choose to fix these issues, you must use {ToolHelpers.SharpToolPrefix + nameof(OverwriteMember_Stateless)} to replace the member with a new definition."));
+                    $"If you choose to fix these issues, you must use {ToolHelpers.SharpToolPrefix + nameof(OverwriteMember)} to replace the member with a new definition."));
 
                 return string.IsNullOrWhiteSpace(analysisResults) ? baseMessage : $"{baseMessage}\n\n{analysisResults}";
             } finally {
                 workspace.Dispose();
             }
-        }, logger, nameof(AddMember_Stateless), cancellationToken);
+        }, logger, nameof(AddMember), cancellationToken);
     }
 
-    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(OverwriteMember_Stateless), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("Stateless version of OverwriteMember. Replaces the definition of an existing member with new C# code in a file. Works without a pre-loaded solution.")]
-    public static async Task<string> OverwriteMember_Stateless(
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(UpdateToolDescription), Idempotent = false, Destructive = false, OpenWorld = false, ReadOnly = false)]
+    [Description("🎯 Safely update only the Description attribute of a SharpTool method without touching the method body")]
+    public static async Task<string> UpdateToolDescription(
+        StatelessWorkspaceFactory workspaceFactory,
+        ICodeModificationService modificationService,
+        ILogger<ModificationToolsLogCategory> logger,
+        [Description("Path to the C# file containing the tool method")] string filePath,
+        [Description("The method name to update (e.g., 'GetMembers')")] string methodName,
+        [Description("The new description text (without [Description(...)] wrapper)")] string newDescription,
+        CancellationToken cancellationToken = default)
+    {
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () =>
+        {
+            ErrorHandlingHelpers.ValidateStringParameter(filePath, nameof(filePath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(methodName, nameof(methodName), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(newDescription, nameof(newDescription), logger);
+
+            if (!File.Exists(filePath))
+            {
+                throw new McpException($"File not found: {filePath}");
+            }
+
+            logger.LogInformation("Executing '{UpdateToolDescription}' for method: {MethodName} in file: {FilePath}",
+                nameof(UpdateToolDescription), methodName, filePath);
+
+            var (workspace, project, document) = await workspaceFactory.CreateForFileAsync(filePath);
+
+            try
+            {
+                if (document == null)
+                {
+                    throw new McpException($"File {filePath} not found in the project");
+                }
+
+                var root = await document.GetSyntaxRootAsync(cancellationToken);
+                if (root == null)
+                {
+                    throw new McpException("Failed to get syntax root for the document");
+                }
+
+                // Find the method by name
+                var methodNode = root.DescendantNodes()
+                    .OfType<MethodDeclarationSyntax>()
+                    .FirstOrDefault(m => m.Identifier.Text == methodName);
+
+                if (methodNode == null)
+                {
+                    throw new McpException($"⚠️ Method '{methodName}' not found in file {filePath}");
+                }
+
+                // Check if it's a SharpTool method
+                var hasSharpToolAttribute = methodNode.AttributeLists
+                    .SelectMany(al => al.Attributes)
+                    .Any(a => a.Name.ToString().Contains("McpServerTool"));
+
+                if (!hasSharpToolAttribute)
+                {
+                    throw new McpException($"⚠️ Method '{methodName}' is not a SharpTool (missing [McpServerTool] attribute)");
+                }
+
+                // Find existing Description attribute
+                AttributeSyntax? existingDescription = null;
+                AttributeListSyntax? containingList = null;
+
+                foreach (var attrList in methodNode.AttributeLists)
+                {
+                    var descAttr = attrList.Attributes
+                        .FirstOrDefault(a => a.Name.ToString() == "Description");
+                    
+                    if (descAttr != null)
+                    {
+                        existingDescription = descAttr;
+                        containingList = attrList;
+                        break;
+                    }
+                }
+
+                SyntaxNode newRoot;
+
+                if (existingDescription != null)
+                {
+                    // Update existing Description attribute
+                    var newDescriptionAttr = SyntaxFactory.Attribute(
+                        SyntaxFactory.IdentifierName("Description"),
+                        SyntaxFactory.AttributeArgumentList(
+                            SyntaxFactory.SingletonSeparatedList(
+                                SyntaxFactory.AttributeArgument(
+                                    SyntaxFactory.LiteralExpression(
+                                        SyntaxKind.StringLiteralExpression,
+                                        SyntaxFactory.Literal(newDescription)
+                                    )
+                                )
+                            )
+                        )
+                    );
+
+                    newRoot = root.ReplaceNode(existingDescription, newDescriptionAttr);
+                }
+                else
+                {
+                    // Add new Description attribute
+                    var newAttrList = SyntaxFactory.AttributeList(
+                        SyntaxFactory.SingletonSeparatedList(
+                            SyntaxFactory.Attribute(
+                                SyntaxFactory.IdentifierName("Description"),
+                                SyntaxFactory.AttributeArgumentList(
+                                    SyntaxFactory.SingletonSeparatedList(
+                                        SyntaxFactory.AttributeArgument(
+                                            SyntaxFactory.LiteralExpression(
+                                                SyntaxKind.StringLiteralExpression,
+                                                SyntaxFactory.Literal(newDescription)
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    );
+
+                    var newMethodNode = methodNode.AddAttributeLists(newAttrList);
+                    newRoot = root.ReplaceNode(methodNode, newMethodNode);
+                }
+
+                var newDocument = document.WithSyntaxRoot(newRoot);
+                var formattedDocument = await modificationService.FormatDocumentAsync(newDocument, cancellationToken);
+                
+                if (!workspace.TryApplyChanges(formattedDocument.Project.Solution))
+                {
+                    throw new McpException("Failed to apply changes to the workspace");
+                }
+
+                return $"✅ Successfully updated Description attribute for method '{methodName}' in {filePath}";
+            }
+            finally
+            {
+                workspace.Dispose();
+            }
+        }, logger, nameof(UpdateToolDescription), cancellationToken);
+    }
+
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(OverwriteMember), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
+    [Description("Replaces the definition of an existing member with new C# code in a file. Works without a pre-loaded solution.")]
+    public static async Task<string> OverwriteMember(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
         ICodeAnalysisService codeAnalysisService,
@@ -1356,8 +636,8 @@ public static class ModificationTools {
                 throw new McpException($"File not found: {filePath}");
             }
 
-            logger.LogInformation("Executing '{OverwriteMember_Stateless}' for: {MemberName} in {FilePath}",
-                nameof(OverwriteMember_Stateless), fullyQualifiedMemberName, filePath);
+            logger.LogInformation("Executing '{OverwriteMember}' for: {MemberName} in {FilePath}",
+                nameof(OverwriteMember), fullyQualifiedMemberName, filePath);
 
             // Create a workspace for the file
             var (workspace, project, document) = await workspaceFactory.CreateForFileAsync(filePath);
@@ -1465,6 +745,15 @@ public static class ModificationTools {
 
                 SyntaxNode? newNode;
                 try {
+                    // PRE-PARSE VALIDATION: Check for syntax errors before processing
+                    var syntaxTree = CSharpSyntaxTree.ParseText(newMemberCode);
+                    var syntaxDiagnostics = syntaxTree.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
+                    
+                    if (syntaxDiagnostics.Any()) {
+                        var errorMessages = string.Join("\n", syntaxDiagnostics.Select(d => $"  - {d.GetMessage()}"));
+                        throw new McpException($"Syntax errors in provided code:\n{errorMessages}");
+                    }
+                    
                     var parsedCode = SyntaxFactory.ParseCompilationUnit(newMemberCode);
                     newNode = parsedCode.Members.FirstOrDefault();
 
@@ -1477,6 +766,61 @@ public static class ModificationTools {
                         throw new McpException($"The new code was parsed as a {newNode.Kind()}, but a TypeDeclaration was expected.");
                     } else if (oldNode is MemberDeclarationSyntax && oldNode is not TypeDeclarationSyntax && newNode is not MemberDeclarationSyntax) {
                         throw new McpException($"The new code was parsed as a {newNode.Kind()}, but a MemberDeclaration was expected.");
+                    }
+
+                    // CRITICAL SAFETY CHECK: Detect incomplete method specifications
+                    if (oldNode is MethodDeclarationSyntax oldMethod && newNode is MethodDeclarationSyntax newMethod) {
+                        // First, check if the old method had a body
+                        bool oldHasBody = oldMethod.Body != null || oldMethod.ExpressionBody != null;
+                        
+                        // Check various indicators that the new method might be incomplete
+                        bool newHasBody = newMethod.Body != null || newMethod.ExpressionBody != null;
+                        bool newIsAbstract = newMethod.Modifiers.Any(m => m.IsKind(SyntaxKind.AbstractKeyword));
+                        bool newIsPartial = newMethod.Modifiers.Any(m => m.IsKind(SyntaxKind.PartialKeyword));
+                        bool newIsExtern = newMethod.Modifiers.Any(m => m.IsKind(SyntaxKind.ExternKeyword));
+                        
+                        // Check if the method ends with a semicolon (could be abstract/interface/extern)
+                        bool newEndsWithSemicolon = newMethod.SemicolonToken.IsKind(SyntaxKind.SemicolonToken);
+                        
+                        // ADDITIONAL CHECK: Analyze the raw text to detect incomplete specifications
+                        string newMethodText = newMethod.ToFullString().Trim();
+                        bool looksIncomplete = false;
+                        
+                        // Pattern detection for incomplete methods
+                        if (!newHasBody && !newIsAbstract && !newIsPartial && !newIsExtern) {
+                            // Check if it looks like just a signature (no braces at all)
+                            if (!newMethodText.Contains("{") && !newMethodText.Contains("=>")) {
+                                looksIncomplete = true;
+                            }
+                            // Check if it ends with ) or > (generic) without body
+                            else if (newMethodText.TrimEnd().EndsWith(")") || newMethodText.TrimEnd().EndsWith(">")) {
+                                looksIncomplete = true;
+                            }
+                        }
+
+                        // If the old method had a body and the new one doesn't (and it's not explicitly abstract/partial/extern)
+                        if (oldHasBody && (!newHasBody || looksIncomplete) && !newIsAbstract && !newIsPartial && !newIsExtern) {
+                            // This is likely an incomplete method specification
+                            var warningMessage = $"⚠️ SAFETY WARNING: The provided code appears to be an incomplete method specification:\n\n" +
+                                               $"Provided code:\n```csharp\n{newMethodText}\n```\n\n" +
+                                               $"This would DELETE the method body! If you want to:\n" +
+                                               $"   - Update the complete method: Include the entire method with its body\n" +
+                                               $"   - Update just the signature: Use UpdateToolDescription for descriptions\n" +
+                                               $"   - Delete the method: Use '// Delete {oldMethod.Identifier.Text}'\n" +
+                                               $"   - View current implementation: Use {ToolHelpers.SharpToolPrefix}GetMethodSignature\n\n" +
+                                               $"💡 Safety tip: Always provide the complete method implementation when using OverwriteMember";
+
+                            throw new McpException(warningMessage);
+                        }
+
+                        // Check for missing attributes that existed in the original
+                        var oldAttributes = oldMethod.AttributeLists.SelectMany(al => al.Attributes).Select(a => a.Name.ToString()).ToHashSet();
+                        var newAttributes = newMethod.AttributeLists.SelectMany(al => al.Attributes).Select(a => a.Name.ToString()).ToHashSet();
+
+                        var missingAttributes = oldAttributes.Except(newAttributes).ToList();
+                        if (missingAttributes.Any()) {
+                            logger.LogWarning("Attributes will be removed: {Attributes}", string.Join(", ", missingAttributes));
+                        }
                     }
                 } catch (Exception ex) when (ex is not McpException && ex is not OperationCanceledException) {
                     logger.LogError(ex, "Failed to parse replacement code");
@@ -1518,12 +862,137 @@ public static class ModificationTools {
             } finally {
                 workspace.Dispose();
             }
-        }, logger, nameof(OverwriteMember_Stateless), cancellationToken);
+        }, logger, nameof(OverwriteMember), cancellationToken);
     }
 
-    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(RenameSymbol_Stateless), Idempotent = true, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("Stateless version of RenameSymbol. Renames a symbol and updates all references in a file. Works without a pre-loaded solution.")]
-    public static async Task<string> RenameSymbol_Stateless(
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(UpdateParameterDescription), Idempotent = false, Destructive = false, OpenWorld = false, ReadOnly = false)]
+    [Description("🎯 Safely update only the Description attribute of a method parameter without changing the method signature")]
+    public static async Task<string> UpdateParameterDescription(
+        StatelessWorkspaceFactory workspaceFactory,
+        ICodeModificationService modificationService,
+        ILogger<ModificationToolsLogCategory> logger,
+        [Description("Path to the C# file containing the method")] string filePath,
+        [Description("The method name containing the parameter")] string methodName,
+        [Description("The parameter name to update")] string parameterName,
+        [Description("The new description text (without [Description(...)] wrapper) - TESTED VERSION")] string newDescription,
+        CancellationToken cancellationToken = default) {
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            ErrorHandlingHelpers.ValidateStringParameter(filePath, nameof(filePath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(methodName, nameof(methodName), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(parameterName, nameof(parameterName), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(newDescription, nameof(newDescription), logger);
+
+            if (!File.Exists(filePath)) {
+                throw new McpException($"File not found: {filePath}");
+            }
+
+            logger.LogInformation("Executing '{UpdateParameterDescription}' for parameter: {ParameterName} in method: {MethodName} in file: {FilePath}",
+                nameof(UpdateParameterDescription), parameterName, methodName, filePath);
+
+            var (workspace, project, document) = await workspaceFactory.CreateForFileAsync(filePath);
+
+            try {
+                if (document == null) {
+                    throw new McpException($"File {filePath} not found in the project");
+                }
+
+                var root = await document.GetSyntaxRootAsync(cancellationToken);
+                if (root == null) {
+                    throw new McpException("Failed to get syntax root for the document");
+                }
+
+                // Find the method by name
+                var methodNode = root.DescendantNodes()
+                    .OfType<MethodDeclarationSyntax>()
+                    .FirstOrDefault(m => m.Identifier.Text == methodName);
+
+                if (methodNode == null) {
+                    throw new McpException($"⚠️ Method '{methodName}' not found in file {filePath}");
+                }
+
+                // Find the parameter by name
+                var parameterNode = methodNode.ParameterList.Parameters
+                    .FirstOrDefault(p => p.Identifier.Text == parameterName);
+
+                if (parameterNode == null) {
+                    throw new McpException($"⚠️ Parameter '{parameterName}' not found in method '{methodName}'");
+                }
+
+                // Find existing Description attribute on the parameter
+                AttributeSyntax? existingDescription = null;
+                AttributeListSyntax? containingList = null;
+
+                foreach (var attrList in parameterNode.AttributeLists) {
+                    var descAttr = attrList.Attributes
+                        .FirstOrDefault(a => a.Name.ToString() == "Description");
+
+                    if (descAttr != null) {
+                        existingDescription = descAttr;
+                        containingList = attrList;
+                        break;
+                    }
+                }
+
+                SyntaxNode newRoot;
+
+                if (existingDescription != null) {
+                    // Update existing Description attribute
+                    var newDescriptionAttr = SyntaxFactory.Attribute(
+                        SyntaxFactory.IdentifierName("Description"),
+                        SyntaxFactory.AttributeArgumentList(
+                            SyntaxFactory.SingletonSeparatedList(
+                                SyntaxFactory.AttributeArgument(
+                                    SyntaxFactory.LiteralExpression(
+                                        SyntaxKind.StringLiteralExpression,
+                                        SyntaxFactory.Literal(newDescription)
+                                    )
+                                )
+                            )
+                        )
+                    );
+
+                    newRoot = root.ReplaceNode(existingDescription, newDescriptionAttr);
+                } else {
+                    // Add new Description attribute
+                    var newAttrList = SyntaxFactory.AttributeList(
+                        SyntaxFactory.SingletonSeparatedList(
+                            SyntaxFactory.Attribute(
+                                SyntaxFactory.IdentifierName("Description"),
+                                SyntaxFactory.AttributeArgumentList(
+                                    SyntaxFactory.SingletonSeparatedList(
+                                        SyntaxFactory.AttributeArgument(
+                                            SyntaxFactory.LiteralExpression(
+                                                SyntaxKind.StringLiteralExpression,
+                                                SyntaxFactory.Literal(newDescription)
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    );
+
+                    var newParameterNode = parameterNode.AddAttributeLists(newAttrList);
+                    newRoot = root.ReplaceNode(parameterNode, newParameterNode);
+                }
+
+                var newDocument = document.WithSyntaxRoot(newRoot);
+                var formattedDocument = await modificationService.FormatDocumentAsync(newDocument, cancellationToken);
+
+                if (!workspace.TryApplyChanges(formattedDocument.Project.Solution)) {
+                    throw new McpException("Failed to apply changes to the workspace");
+                }
+
+                return $"✅ Successfully updated Description attribute for parameter '{parameterName}' in method '{methodName}' in {filePath}";
+            } finally {
+                workspace.Dispose();
+            }
+        }, logger, nameof(UpdateParameterDescription), cancellationToken);
+    }
+
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(RenameSymbol), Idempotent = true, Destructive = true, OpenWorld = false, ReadOnly = false)]
+    [Description("Renames a symbol and updates all references in a file. Works without a pre-loaded solution.")]
+    public static async Task<string> RenameSymbol(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
         ICodeAnalysisService codeAnalysisService,
@@ -1547,8 +1016,8 @@ public static class ModificationTools {
                 throw new McpException($"'{newName}' is not a valid C# identifier for renaming.");
             }
 
-            logger.LogInformation("Executing '{RenameSymbol_Stateless}' for {OldName} to {NewName} in {FilePath}",
-                nameof(RenameSymbol_Stateless), oldName, newName, filePath);
+            logger.LogInformation("Executing '{RenameSymbol}' for {OldName} to {NewName} in {FilePath}",
+                nameof(RenameSymbol), oldName, newName, filePath);
 
             // Create a workspace for the file
             var (workspace, project, document) = await workspaceFactory.CreateForFileAsync(filePath);
@@ -1627,11 +1096,11 @@ public static class ModificationTools {
             } finally {
                 workspace.Dispose();
             }
-        }, logger, nameof(RenameSymbol_Stateless), cancellationToken);
+        }, logger, nameof(RenameSymbol), cancellationToken);
     }
-    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(FindAndReplace_Stateless), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("Stateless version of FindAndReplace. Performs regex-based find and replace in a single file. Works without a pre-loaded solution.")]
-    public static async Task<string> FindAndReplace_Stateless(
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(FindAndReplace), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
+    [Description("Performs regex-based find and replace in a single file. Works without a pre-loaded solution.")]
+    public static async Task<string> FindAndReplace(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
         IDocumentOperationsService documentOperations,
@@ -1663,8 +1132,8 @@ public static class ModificationTools {
                 .Replace(@"\r\n", @"\n")
                 .Replace(@"\r", @"\n");
 
-            logger.LogInformation("Executing '{FindAndReplace_Stateless}' with pattern: '{Pattern}' in {FilePath}",
-                nameof(FindAndReplace_Stateless), regexPattern, filePath);
+            logger.LogInformation("Executing '{FindAndReplace}' with pattern: '{Pattern}' in {FilePath}",
+                nameof(FindAndReplace), regexPattern, filePath);
 
             // Validate the regex pattern
             try {
@@ -1755,12 +1224,12 @@ public static class ModificationTools {
             } finally {
                 workspace.Dispose();
             }
-        }, logger, nameof(FindAndReplace_Stateless), cancellationToken);
+        }, logger, nameof(FindAndReplace), cancellationToken);
     }
 
-    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(MoveMember_Stateless), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("Stateless version of MoveMember. Moves a member (property, field, method, nested type, etc.) from one type/namespace to another. Requires the solution path since member moves need full solution context.")]
-    public static async Task<string> MoveMember_Stateless(
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(MoveMember), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
+    [Description("Moves a member (property, field, method, nested type, etc.) from one type/namespace to another. Requires the solution path since member moves need full solution context.")]
+    public static async Task<string> MoveMember(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
         IFuzzyFqnLookupService fuzzyLookup,
@@ -1769,12 +1238,12 @@ public static class ModificationTools {
         [Description("FQN of the member to move.")] string fullyQualifiedMemberName,
         [Description("FQN of the destination type or namespace where the member should be moved.")] string fullyQualifiedDestinationTypeOrNamespaceName,
         CancellationToken cancellationToken = default) {
-        
+
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
             ErrorHandlingHelpers.ValidateStringParameter(solutionPath, nameof(solutionPath), logger);
             ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedMemberName, nameof(fullyQualifiedMemberName), logger);
             ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedDestinationTypeOrNamespaceName, nameof(fullyQualifiedDestinationTypeOrNamespaceName), logger);
-            
+
             // Validate solution file exists and has correct extension
             if (!File.Exists(solutionPath)) {
                 throw new McpException($"Solution file not found: {solutionPath}");
@@ -1783,11 +1252,11 @@ public static class ModificationTools {
                 throw new McpException($"File '{solutionPath}' is not a .sln file.");
             }
 
-            logger.LogInformation("Executing '{MoveMember_Stateless}' moving {MemberName} to {DestinationName} in solution {SolutionPath}",
-                nameof(MoveMember_Stateless), fullyQualifiedMemberName, fullyQualifiedDestinationTypeOrNamespaceName, solutionPath);
+            logger.LogInformation("Executing '{MoveMember}' moving {MemberName} to {DestinationName} in solution {SolutionPath}",
+                nameof(MoveMember), fullyQualifiedMemberName, fullyQualifiedDestinationTypeOrNamespaceName, solutionPath);
 
             var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(solutionPath);
-            
+
             try {
                 Solution solution;
                 if (context is Solution sol) {
@@ -1798,7 +1267,7 @@ public static class ModificationTools {
                     var dynamicContext = (dynamic)context;
                     solution = ((Project)dynamicContext.Project).Solution;
                 }
-                
+
                 // Find the source member symbol using fuzzy lookup
                 var tempSolutionManager = new StatelessSolutionManager(solution);
                 var sourceMemberMatches = await fuzzyLookup.FindMatchesAsync(fullyQualifiedMemberName, tempSolutionManager, cancellationToken);
@@ -1806,7 +1275,7 @@ public static class ModificationTools {
                 if (sourceMemberMatch == null) {
                     throw new McpException($"No symbol found matching '{fullyQualifiedMemberName}'.");
                 }
-                
+
                 var sourceMemberSymbol = sourceMemberMatch.Symbol;
                 if (sourceMemberSymbol == null) {
                     throw new McpException($"Could not find symbol '{fullyQualifiedMemberName}' in the workspace.");
@@ -1822,7 +1291,7 @@ public static class ModificationTools {
                 if (destinationMatch == null) {
                     throw new McpException($"No symbol found matching '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
                 }
-                
+
                 var destinationSymbol = destinationMatch.Symbol;
 
                 if (destinationSymbol is not (INamedTypeSymbol or INamespaceSymbol)) {
@@ -1874,7 +1343,7 @@ public static class ModificationTools {
 
                 string memberName = GetMemberName(memberDeclaration);
                 INamedTypeSymbol? updatedDestinationTypeSymbol = null;
-                
+
                 if (destinationTypeSymbol != null) {
                     // Re-resolve destinationTypeSymbol from the potentially updated solution
                     var destinationDocumentFromCurrentSolution = solution.GetDocument(destinationDocument.Id)
@@ -1934,14 +1403,14 @@ public static class ModificationTools {
                     var finalDestinationDocument = finalSolution.GetDocument(destinationDocument.Id);
 
                     StringBuilder errorBuilder = new StringBuilder();
-                    
+
                     // Since we're stateless, we'll do a simple compilation check
                     if (finalSourceDocument != null) {
                         var sourceSemanticModel = await finalSourceDocument.GetSemanticModelAsync(cancellationToken);
                         var sourceDiagnostics = sourceSemanticModel?.GetDiagnostics()
                             .Where(d => d.Severity == DiagnosticSeverity.Error)
                             .Take(5);
-                        
+
                         if (sourceDiagnostics?.Any() == true) {
                             errorBuilder.AppendLine($"Compilation errors in source file {finalSourceDocument.FilePath}:");
                             foreach (var diag in sourceDiagnostics) {
@@ -1955,7 +1424,7 @@ public static class ModificationTools {
                         var destDiagnostics = destSemanticModel?.GetDiagnostics()
                             .Where(d => d.Severity == DiagnosticSeverity.Error)
                             .Take(5);
-                        
+
                         if (destDiagnostics?.Any() == true) {
                             errorBuilder.AppendLine($"Compilation errors in destination file {finalDestinationDocument.FilePath}:");
                             foreach (var diag in destDiagnostics) {
@@ -1974,16 +1443,16 @@ public static class ModificationTools {
                     var errorInfo = errorBuilder.Length > 0 ? $"\n\nCompilation status:\n{errorBuilder}" : "";
 
                     return $"Successfully moved member '{memberName}' to '{fullyQualifiedDestinationTypeOrNamespaceName}' {locationInfo}.{errorInfo}";
-                    
+
                 } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
                     logger.LogError(ex, "Failed to move member {MemberName} to {DestinationName}", fullyQualifiedMemberName, fullyQualifiedDestinationTypeOrNamespaceName);
                     throw new McpException($"Failed to move member '{fullyQualifiedMemberName}' to '{fullyQualifiedDestinationTypeOrNamespaceName}': {ex.Message}", ex);
                 }
-                
+
             } finally {
                 workspace.Dispose();
             }
-        }, logger, nameof(MoveMember_Stateless), cancellationToken);
+        }, logger, nameof(MoveMember), cancellationToken);
     }
 
     #endregion
