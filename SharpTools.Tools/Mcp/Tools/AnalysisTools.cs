@@ -32,8 +32,35 @@ public static partial class AnalysisTools {
                 membersByKind[kind] = new List<object>();
             }
 
+            // Build signature without duplicates
+            var memberModifiers = ToolHelpers.GetRoslynSymbolModifiersString(member);
+            var memberBaseSignature = CodeAnalysisService.GetFormattedSignatureAsync(member, false);
+            
+            // Combine modifiers and signature, avoiding duplicates
+            string memberSignature;
+            if (!string.IsNullOrWhiteSpace(memberModifiers)) {
+                if (memberBaseSignature.StartsWith(memberModifiers)) {
+                    memberSignature = memberBaseSignature;
+                } else {
+                    memberSignature = $"{memberModifiers} {memberBaseSignature}".Trim();
+                }
+            } else {
+                memberSignature = memberBaseSignature;
+            }
+            
+            // Fix duplicate return type issue for methods
+            if (member is IMethodSymbol memberMethod) {
+                if (memberMethod.ReturnsVoid) {
+                    memberSignature = System.Text.RegularExpressions.Regex.Replace(memberSignature, @"\bvoid\s+void\b", "void");
+                } else {
+                    var memberReturnType = memberMethod.ReturnType.ToDisplayString();
+                    var memberDuplicatePattern = $@"\b{System.Text.RegularExpressions.Regex.Escape(memberReturnType)}\s+{System.Text.RegularExpressions.Regex.Escape(memberReturnType)}\b";
+                    memberSignature = System.Text.RegularExpressions.Regex.Replace(memberSignature, memberDuplicatePattern, memberReturnType);
+                }
+            }
+            
             var memberInfo = new {
-                signature = ToolHelpers.GetRoslynSymbolModifiersString(member) + " " + CodeAnalysisService.GetFormattedSignatureAsync(member, false),
+                signature = memberSignature,
                 fullyQualifiedName = FuzzyFqnLookupService.GetSearchableString(member),
                 line = memberLocation?.StartLine,
                 members = member is INamedTypeSymbol nestedType ?
@@ -468,9 +495,38 @@ public static partial class AnalysisTools {
 
                             var kind = ToolHelpers.GetSymbolKindString(member);
                             string xmlDocs = await codeAnalysisService.GetXmlDocumentationAsync(member, cancellationToken) ?? string.Empty;
-                            string signature = ToolHelpers.GetRoslynSymbolModifiersString(member)
-                                + " " + (CodeAnalysisService.GetFormattedSignatureAsync(member, false)).Replace(typeName + ".", string.Empty).Trim()
-                                + (!string.IsNullOrEmpty(xmlDocs) ? $" // {xmlDocs.Replace("\n", " ").Replace("\r", "")}" : "");
+                            
+                            // Build signature without duplicates
+                            var modifiers = ToolHelpers.GetRoslynSymbolModifiersString(member);
+                            var baseSignature = CodeAnalysisService.GetFormattedSignatureAsync(member, false).Replace(typeName + ".", string.Empty).Trim();
+                            
+                            // Combine modifiers and signature, avoiding duplicates
+                            string signature;
+                            if (!string.IsNullOrWhiteSpace(modifiers)) {
+                                if (baseSignature.StartsWith(modifiers)) {
+                                    signature = baseSignature;
+                                } else {
+                                    signature = $"{modifiers} {baseSignature}".Trim();
+                                }
+                            } else {
+                                signature = baseSignature;
+                            }
+                            
+                            // Fix duplicate return type issue for methods
+                            if (member is IMethodSymbol methodSymbol) {
+                                if (methodSymbol.ReturnsVoid) {
+                                    signature = System.Text.RegularExpressions.Regex.Replace(signature, @"\bvoid\s+void\b", "void");
+                                } else {
+                                    var returnType = methodSymbol.ReturnType.ToDisplayString();
+                                    var duplicatePattern = $@"\b{System.Text.RegularExpressions.Regex.Escape(returnType)}\s+{System.Text.RegularExpressions.Regex.Escape(returnType)}\b";
+                                    signature = System.Text.RegularExpressions.Regex.Replace(signature, duplicatePattern, returnType);
+                                }
+                            }
+                            
+                            // Add XML documentation comment if available
+                            if (!string.IsNullOrEmpty(xmlDocs)) {
+                                signature += $" // {xmlDocs.Replace("\n", " ").Replace("\r", "")}";
+                            }
 
                             if (!membersByLocation.ContainsKey(locationKey)) {
                                 membersByLocation[locationKey] = new Dictionary<string, List<string>>();
@@ -548,18 +604,27 @@ public static partial class AnalysisTools {
                 // Build the signature
                 var modifiers = ToolHelpers.GetRoslynSymbolModifiersString(methodSymbol);
                 var signature = CodeAnalysisService.GetFormattedSignatureAsync(methodSymbol, false);
-                // Remove duplicate modifiers if any
-                var fullSignature = $"{modifiers} {signature}".Trim();
                 
-                // Fix duplicate return type issue
+                // Combine modifiers and signature, avoiding duplicates
+                string fullSignature;
+                if (!string.IsNullOrWhiteSpace(modifiers)) {
+                    // Check if signature already starts with the modifiers
+                    if (signature.StartsWith(modifiers)) {
+                        fullSignature = signature;
+                    } else {
+                        fullSignature = $"{modifiers} {signature}".Trim();
+                    }
+                } else {
+                    fullSignature = signature;
+                }
+                
+                // Additional fix for duplicate return type issue
                 if (methodSymbol.ReturnsVoid) {
-                    fullSignature = fullSignature.Replace("void void", "void");
+                    fullSignature = System.Text.RegularExpressions.Regex.Replace(fullSignature, @"\bvoid\s+void\b", "void");
                 } else {
                     var returnType = methodSymbol.ReturnType.ToDisplayString();
-                    var duplicatePattern = $"{returnType} {returnType}";
-                    if (fullSignature.Contains(duplicatePattern)) {
-                        fullSignature = fullSignature.Replace(duplicatePattern, returnType);
-                    }
+                    var duplicatePattern = $@"\b{System.Text.RegularExpressions.Regex.Escape(returnType)}\s+{System.Text.RegularExpressions.Regex.Escape(returnType)}\b";
+                    fullSignature = System.Text.RegularExpressions.Regex.Replace(fullSignature, duplicatePattern, returnType);
                 }
 
                 // Get XML documentation if available
