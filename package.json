@@ -1,0 +1,38 @@
+{
+  "name": "sharptools-mcp",
+  "version": "1.0.0",
+  "description": "SharpTools MCP Server Build and Deploy Tasks",
+  "scripts": {
+    "clean": "node scripts/clean.js",
+    "deploy": "node scripts/deploy-stdio.js",
+    "deploy:wsl": "node scripts/deploy-wsl.js",
+    "deploy:all": "npm run deploy && npm run deploy:wsl",
+    "deploy:clean": "npm run clean && npm run deploy:all",
+    "start": "node scripts/start-stdio.js"
+  },
+  "config": {
+    "deployPath": "C:\\Users\\info\\OneDrive\\Software\\MyTool\\SharpTools",
+    "deployPathWsl": "C:\\Users\\info\\OneDrive\\Software\\MyTool\\SharpToolsWsl",
+    "logLevel": "Debug"
+  },
+  "devDependencies": {
+    "fs-extra": "^11.1.1",
+    "path": "^0.12.7"
+  },
+  "engines": {
+    "node": ">=16.0.0",
+    "dotnet": ">=9.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zio3/SharpToolsMCP.git"
+  },
+  "keywords": [
+    "mcp",
+    "csharp",
+    "roslyn",
+    "code-analysis"
+  ],
+  "author": "zio3",
+  "license": "MIT"
+}

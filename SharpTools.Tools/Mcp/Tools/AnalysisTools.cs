@@ -795,6 +795,102 @@ public static partial class AnalysisTools {
         }, logger, nameof(GetMethodSignature), cancellationToken);
     }
 
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(GetMethodImplementation), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
+    [Description("🔍 .NET専用 - .cs/.sln/.csprojファイルのみ対応。メソッドの完全な実装（本体含む）を取得")]
+    public static async Task<object> GetMethodImplementation(
+        StatelessWorkspaceFactory workspaceFactory,
+        ICodeAnalysisService codeAnalysisService,
+        IFuzzyFqnLookupService fuzzyFqnLookupService,
+        ILogger<AnalysisToolsLogCategory> logger,
+        [Description(".NETソリューション(.sln)またはプロジェクト(.csproj)ファイルのパス")] string solutionOrProjectPath,
+        [Description("Method name (e.g., 'ProcessData', 'MyClass.ProcessData', or full FQN)")] string methodName,
+        [Description("実装の最大行数制限（デフォルト: 500）")] int maxLines = 500,
+        [Description("XMLドキュメントも含めるか（デフォルト: true）")] bool includeDocumentation = true,
+        [Description("依存関係情報も含めるか（デフォルト: false）")] bool includeDependencies = false,
+        CancellationToken cancellationToken = default) {
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            // 🔍 .NET関連ファイル検証（最優先実行）
+            CSharpFileValidationHelper.ValidateDotNetFileForRoslyn(solutionOrProjectPath, nameof(GetMethodImplementation), logger);
+            
+            ErrorHandlingHelpers.ValidateStringParameter(solutionOrProjectPath, nameof(solutionOrProjectPath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(methodName, nameof(methodName), logger);
+
+            logger.LogInformation("Executing '{GetMethodImplementation}' for: {MethodName} in context {ProjectOrFilePath}",
+                nameof(GetMethodImplementation), methodName, solutionOrProjectPath);
+
+            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(solutionOrProjectPath);
+
+            try {
+                Solution solution;
+                if (context is Solution sol) {
+                    solution = sol;
+                } else if (context is Project proj) {
+                    solution = proj.Solution;
+                } else {
+                    var dynamicContext = (dynamic)context;
+                    solution = ((Project)dynamicContext.Project).Solution;
+                }
+
+                // 改善されたFuzzyFqnLookupServiceで検索
+                var fuzzyMatches = await fuzzyFqnLookupService.FindMatchesAsync(methodName, new StatelessSolutionManager(solution), cancellationToken);
+                var methodMatches = fuzzyMatches
+                    .Where(m => m.Symbol is IMethodSymbol)
+                    .OrderByDescending(m => m.Score)
+                    .Take(10) // 最大10件の候補を返す
+                    .ToList();
+
+                if (!methodMatches.Any()) {
+                    var availableMethodsHint = "";
+                    if (!methodName.Contains(".")) {
+                        availableMethodsHint = "\n• より具体的に: 'ClassName.MethodName' の形式で試してください";
+                    } else if (methodName.Split('.').Length == 2) {
+                        availableMethodsHint = "\n• より具体的に: 'Namespace.ClassName.MethodName' の形式で試してください";
+                    }
+                    
+                    throw new McpException($"メソッドが見つかりません: '{methodName}'\n確認方法:\n• {ToolHelpers.SharpToolPrefix}{nameof(GetMembers)} で利用可能なメソッドを確認{availableMethodsHint}\n• 型名とメソッド名が正しいかを確認");
+                }
+
+                // メソッドのグループ（オーバーロード）を識別
+                var methodGroups = methodMatches
+                    .GroupBy(m => new { 
+                        ContainingType = ((IMethodSymbol)m.Symbol).ContainingType.ToDisplayString(ToolHelpers.FullyQualifiedFormatWithoutGlobal),
+                        Name = ((IMethodSymbol)m.Symbol).Name 
+                    })
+                    .ToList();
+
+                var results = new List<MethodImplementationDetail>();
+
+                foreach (var match in methodMatches) {
+                    var methodSymbol = (IMethodSymbol)match.Symbol;
+                    var detail = await BuildMethodImplementationDetail(methodSymbol, match, solution, codeAnalysisService, maxLines, includeDocumentation, includeDependencies, cancellationToken);
+                    
+                    // オーバーロードが存在するかチェック
+                    var groupKey = new { 
+                        ContainingType = methodSymbol.ContainingType.ToDisplayString(ToolHelpers.FullyQualifiedFormatWithoutGlobal),
+                        Name = methodSymbol.Name 
+                    };
+                    detail.IsOverloaded = methodGroups.Any(g => g.Key.Equals(groupKey) && g.Count() > 1);
+                    
+                    results.Add(detail);
+                }
+
+                var result = new MethodImplementationResult {
+                    SearchTerm = methodName,
+                    TotalMatches = results.Count,
+                    Methods = results
+                };
+
+                if (results.Count > 1) {
+                    result.Note = $"複数のメソッドが見つかりました。より具体的な名前で検索するか、{ToolHelpers.SharpToolPrefix}OverwriteMember で特定のシグネチャを指定してください。";
+                }
+
+                return ToolHelpers.ToJson(result);
+            } finally {
+                workspace?.Dispose();
+            }
+        }, logger, nameof(GetMethodImplementation), cancellationToken);
+    }
+
     // 構造化されたメソッド詳細を構築するヘルパーメソッド
     private static async Task<MethodDetail> BuildStructuredMethodDetail(IMethodSymbol methodSymbol, FuzzyMatchResult match, ICodeAnalysisService codeAnalysisService, CancellationToken cancellationToken) {
         // 基本情報の取得
@@ -900,6 +996,271 @@ public static partial class AnalysisTools {
         };
     }
 
+    // メソッドの完全な実装詳細を構築するヘルパーメソッド
+    private static async Task<MethodImplementationDetail> BuildMethodImplementationDetail(
+        IMethodSymbol methodSymbol, 
+        FuzzyMatchResult match, 
+        Solution solution,
+        ICodeAnalysisService codeAnalysisService, 
+        int maxLines,
+        bool includeDocumentation,
+        bool includeDependencies,
+        CancellationToken cancellationToken) {
+        
+        // 基本情報の取得
+        var locationInfo = GetDeclarationLocationInfo(methodSymbol);
+        var location = locationInfo.FirstOrDefault();
+        
+        // シグネチャの生成
+        var signature = CodeAnalysisService.GetFormattedSignatureAsync(methodSymbol, includeContainingType: true);
+        
+        // モディファイアの取得
+        var modifiers = ToolHelpers.GetRoslynSymbolModifiersString(methodSymbol).Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList();
+        
+        // パラメータ詳細の取得
+        var parameters = new List<AnalysisTools.ParameterDetail>();
+        foreach (var param in methodSymbol.Parameters) {
+            var paramModifiers = new List<string>();
+            if (param.RefKind == RefKind.Ref) paramModifiers.Add("ref");
+            else if (param.RefKind == RefKind.Out) paramModifiers.Add("out");
+            else if (param.RefKind == RefKind.In) paramModifiers.Add("in");
+            if (param.IsParams) paramModifiers.Add("params");
+            
+            parameters.Add(new AnalysisTools.ParameterDetail {
+                Name = param.Name,
+                Type = param.Type.ToDisplayString(ToolHelpers.FullyQualifiedFormatWithoutGlobal),
+                DefaultValue = param.HasExplicitDefaultValue ? param.ExplicitDefaultValue?.ToString() : null,
+                IsOptional = param.IsOptional,
+                Modifiers = paramModifiers
+            });
+        }
+        
+        // 実装の取得
+        string fullImplementation = string.Empty;
+        string? xmlDocumentation = null;
+        int actualLineCount = 0;
+        MethodDependencies? dependencies = null;
+        
+        if (methodSymbol.DeclaringSyntaxReferences.Any()) {
+            var syntaxRef = methodSymbol.DeclaringSyntaxReferences.First();
+            var syntaxTree = syntaxRef.SyntaxTree;
+            
+            if (syntaxTree != null) {
+                var root = await syntaxTree.GetRootAsync(cancellationToken);
+                var methodNode = root.FindNode(syntaxRef.Span);
+                
+                // より上位のメソッド宣言ノードを探す
+                var methodDeclaration = methodNode.AncestorsAndSelf()
+                    .OfType<MethodDeclarationSyntax>()
+                    .FirstOrDefault();
+                
+                if (methodDeclaration != null) {
+                    // XMLドキュメントの取得
+                    if (includeDocumentation) {
+                        var trivia = methodDeclaration.GetLeadingTrivia();
+                        var xmlTrivia = trivia
+                            .Where(t => t.IsKind(SyntaxKind.SingleLineDocumentationCommentTrivia) || 
+                                       t.IsKind(SyntaxKind.MultiLineDocumentationCommentTrivia))
+                            .ToList();
+                        
+                        if (xmlTrivia.Any()) {
+                            xmlDocumentation = string.Join("\n", xmlTrivia.Select(t => t.ToString().Trim()));
+                        }
+                    }
+                    
+                    // 完全な実装を取得（属性、XMLドキュメント、メソッド本体含む）
+                    var fullNode = methodDeclaration;
+                    if (includeDocumentation && xmlDocumentation != null) {
+                        // XMLドキュメントコメントも含める
+                        fullImplementation = methodDeclaration.GetLeadingTrivia().ToString() + methodDeclaration.ToString();
+                    } else {
+                        fullImplementation = methodDeclaration.ToString();
+                    }
+                    
+                    // インデントの正規化
+                    fullImplementation = NormalizeIndentation(fullImplementation);
+                    
+                    // 行数のカウント
+                    var lines = fullImplementation.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+                    actualLineCount = lines.Length;
+                    
+                    // 依存関係の解析
+                    if (includeDependencies) {
+                        var document = solution.GetDocument(syntaxTree);
+                        if (document != null) {
+                            var semanticModel = await document.GetSemanticModelAsync(cancellationToken);
+                            if (semanticModel != null) {
+                                dependencies = AnalyzeDependencies(methodDeclaration, semanticModel);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // サイズ制限の適用
+        bool isTruncated = false;
+        string? truncationWarning = null;
+        int displayedLineCount = actualLineCount;
+        
+        if (actualLineCount > maxLines) {
+            isTruncated = true;
+            fullImplementation = TruncateImplementation(fullImplementation, maxLines);
+            displayedLineCount = maxLines;
+            truncationWarning = $"実装が{maxLines}行を超えています（実際: {actualLineCount}行）。表示は最初と最後の{maxLines/2}行に制限されています。";
+        }
+        
+        return new MethodImplementationDetail {
+            Name = methodSymbol.Name,
+            Signature = signature,
+            FullImplementation = fullImplementation,
+            FullyQualifiedName = methodSymbol.ToDisplayString(ToolHelpers.FullyQualifiedFormatWithoutGlobal),
+            ContainingType = methodSymbol.ContainingType.ToDisplayString(ToolHelpers.FullyQualifiedFormatWithoutGlobal),
+            ReturnType = methodSymbol.ReturnType.ToDisplayString(ToolHelpers.FullyQualifiedFormatWithoutGlobal),
+            Parameters = parameters,
+            Location = location != null ? new LocationInfo {
+                FilePath = location.FilePath,
+                StartLine = location.StartLine,
+                EndLine = location.EndLine
+            } : null,
+            XmlDocumentation = xmlDocumentation,
+            Modifiers = modifiers,
+            IsOverloaded = false, // これは呼び出し元で設定される
+            IsTruncated = isTruncated,
+            ActualLineCount = actualLineCount,
+            DisplayedLineCount = displayedLineCount,
+            Dependencies = dependencies,
+            TruncationWarning = truncationWarning
+        };
+    }
+    
+    // インデントを正規化するヘルパーメソッド
+    private static string NormalizeIndentation(string implementation) {
+        var lines = implementation.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+        
+        // 空でない行の最小インデントを見つける
+        int minIndent = int.MaxValue;
+        foreach (var line in lines) {
+            if (!string.IsNullOrWhiteSpace(line)) {
+                int indent = 0;
+                while (indent < line.Length && char.IsWhiteSpace(line[indent])) {
+                    indent++;
+                }
+                minIndent = Math.Min(minIndent, indent);
+            }
+        }
+        
+        // 最小インデントを削除
+        if (minIndent < int.MaxValue && minIndent > 0) {
+            for (int i = 0; i < lines.Length; i++) {
+                if (lines[i].Length >= minIndent) {
+                    lines[i] = lines[i].Substring(minIndent);
+                }
+            }
+        }
+        
+        return string.Join(Environment.NewLine, lines);
+    }
+    
+    // 実装を省略するヘルパーメソッド
+    private static string TruncateImplementation(string implementation, int maxLines) {
+        var lines = implementation.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+        
+        if (lines.Length <= maxLines) {
+            return implementation;
+        }
+        
+        int halfLines = maxLines / 2;
+        var result = new List<string>();
+        
+        // 最初のhalfLines行
+        result.AddRange(lines.Take(halfLines));
+        
+        // 省略マーカー
+        result.Add("");
+        result.Add("// ... [省略: " + (lines.Length - maxLines) + "行] ...");
+        result.Add("");
+        
+        // 最後のhalfLines行
+        result.AddRange(lines.Skip(lines.Length - halfLines));
+        
+        return string.Join(Environment.NewLine, result);
+    }
+    
+    // 依存関係を解析するヘルパーメソッド
+    private static MethodDependencies AnalyzeDependencies(MethodDeclarationSyntax methodNode, SemanticModel semanticModel) {
+        var dependencies = new MethodDependencies();
+        
+        // メソッド呼び出しの解析
+        var invocations = methodNode.DescendantNodes().OfType<InvocationExpressionSyntax>();
+        foreach (var invocation in invocations) {
+            var symbolInfo = semanticModel.GetSymbolInfo(invocation);
+            if (symbolInfo.Symbol is IMethodSymbol calledMethod) {
+                var methodName = calledMethod.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
+                if (!dependencies.CalledMethods.Contains(methodName)) {
+                    dependencies.CalledMethods.Add(methodName);
+                }
+            }
+        }
+        
+        // フィールド・プロパティアクセスの解析
+        var memberAccesses = methodNode.DescendantNodes().OfType<MemberAccessExpressionSyntax>();
+        foreach (var memberAccess in memberAccesses) {
+            var symbolInfo = semanticModel.GetSymbolInfo(memberAccess);
+            if (symbolInfo.Symbol is IFieldSymbol field) {
+                var fieldName = field.Name;
+                if (!dependencies.UsedFields.Contains(fieldName)) {
+                    dependencies.UsedFields.Add(fieldName);
+                }
+            } else if (symbolInfo.Symbol is IPropertySymbol property) {
+                var propertyName = property.Name;
+                if (!dependencies.UsedProperties.Contains(propertyName)) {
+                    dependencies.UsedProperties.Add(propertyName);
+                }
+            }
+        }
+        
+        // 使用している型の解析
+        var identifierNames = methodNode.DescendantNodes().OfType<IdentifierNameSyntax>();
+        foreach (var identifier in identifierNames) {
+            var symbolInfo = semanticModel.GetSymbolInfo(identifier);
+            if (symbolInfo.Symbol is ITypeSymbol typeSymbol && 
+                typeSymbol.TypeKind != TypeKind.TypeParameter) {
+                var typeName = typeSymbol.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
+                if (!dependencies.UsedTypes.Contains(typeName) && 
+                    !IsCommonType(typeName)) {
+                    dependencies.UsedTypes.Add(typeName);
+                }
+            }
+        }
+        
+        // throw文の解析
+        var throwStatements = methodNode.DescendantNodes().OfType<ThrowStatementSyntax>();
+        foreach (var throwStatement in throwStatements) {
+            if (throwStatement.Expression != null) {
+                var typeInfo = semanticModel.GetTypeInfo(throwStatement.Expression);
+                if (typeInfo.Type != null) {
+                    var exceptionType = typeInfo.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
+                    if (!dependencies.ThrownExceptions.Contains(exceptionType)) {
+                        dependencies.ThrownExceptions.Add(exceptionType);
+                    }
+                }
+            }
+        }
+        
+        return dependencies;
+    }
+    
+    // 一般的な型かどうかを判定するヘルパーメソッド
+    private static bool IsCommonType(string typeName) {
+        var commonTypes = new HashSet<string> {
+            "string", "int", "long", "double", "float", "decimal", "bool",
+            "object", "void", "Task", "Task<>", "List<>", "Dictionary<,>",
+            "IEnumerable<>", "IList<>", "Array", "DateTime", "TimeSpan"
+        };
+        
+        return commonTypes.Any(t => typeName.StartsWith(t));
+    }
 
     #endregion
 
