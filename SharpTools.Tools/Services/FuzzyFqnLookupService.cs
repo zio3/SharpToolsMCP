@@ -213,9 +213,78 @@ namespace SharpTools.Tools.Services {
                 return (CaseInsensitiveMatchScore, "Case-insensitive exact match");
             }
 
+            // ★新規追加: 後方一致検索（高優先度）
+            if (canonicalFqn.EndsWith(userInputFqn, StringComparison.OrdinalIgnoreCase)) {
+                // 一致度を長さの比率で計算（ユーザー入力が長いほど良いマッチ）
+                double lengthRatio = (double)userInputFqn.Length / canonicalFqn.Length;
+                double suffixScore = 0.85 + (lengthRatio * 0.1); // 0.85-0.95の範囲
+                return (suffixScore, $"Suffix match");
+            }
+
             // Prepare normalized versions for comparison
             string userInputNoParams = RemoveParameters(userInputFqn);
             string canonicalFqnNoParams = RemoveParameters(canonicalFqn);
+
+            // ★NEW: Parameter-aware matching - check if user specified parameters
+            bool userHasParams = userInputFqn.Length != userInputNoParams.Length;
+            bool canonicalHasParams = canonicalFqn.Length != canonicalFqnNoParams.Length;
+            
+            // ★NEW: If both have parameters, check parameter type compatibility first
+            if (userHasParams && canonicalHasParams && symbol is IMethodSymbol paramMethodSymbol) {
+                // Extract parameter types from user input: "Method(System.Int32,System.String)" -> ["System.Int32", "System.String"]
+                string userParamSection = userInputFqn.Substring(userInputNoParams.Length);
+                if (userParamSection.StartsWith("(") && userParamSection.EndsWith(")")) {
+                    string userParamList = userParamSection.Substring(1, userParamSection.Length - 2).Trim();
+                    var userParamTypes = string.IsNullOrEmpty(userParamList) 
+                        ? new string[0] 
+                        : userParamList.Split(',').Select(p => p.Trim()).ToArray();
+                    
+                    // Check if parameter count matches
+                    if (userParamTypes.Length == paramMethodSymbol.Parameters.Length) {
+                        bool parametersMatch = true;
+                        for (int i = 0; i < userParamTypes.Length && parametersMatch; i++) {
+                            var userParamType = userParamTypes[i];
+                            var canonicalParamType = paramMethodSymbol.Parameters[i].Type.ToDisplayString();
+                            
+                            // Check various type name formats (System.Int32 vs int, System.String vs string, etc.)
+                            if (!AreParameterTypesEquivalent(userParamType, canonicalParamType)) {
+                                parametersMatch = false;
+                            }
+                        }
+                        
+                        if (parametersMatch) {
+                            // Check if the method name part also matches
+                            if (canonicalFqnNoParams.EndsWith(userInputNoParams, StringComparison.OrdinalIgnoreCase)) {
+                                return (PerfectMatchScore - 0.01, "Exact method signature match");
+                            }
+                        } else {
+                            // Same method name but different parameters - lower score
+                            if (canonicalFqnNoParams.EndsWith(userInputNoParams, StringComparison.OrdinalIgnoreCase)) {
+                                return (ParametersContentMismatchScore, "Method name match but parameter types differ");
+                            }
+                        }
+                    } else {
+                        // Different parameter count - lower score
+                        if (canonicalFqnNoParams.EndsWith(userInputNoParams, StringComparison.OrdinalIgnoreCase)) {
+                            return (ParametersContentMismatchScore - 0.1, "Method name match but parameter count differs");
+                        }
+                    }
+                }
+            }
+
+            // ★MODIFIED: パラメータ除去後の後方一致 (now lower priority for cases where parameters were specified but didn't match)
+            if (canonicalFqnNoParams.EndsWith(userInputNoParams, StringComparison.OrdinalIgnoreCase)) {
+                double lengthRatio = (double)userInputNoParams.Length / canonicalFqnNoParams.Length;
+                double suffixScoreNoParams = 0.80 + (lengthRatio * 0.1); // 0.80-0.90の範囲
+                
+                // If user specified parameters but we're matching without them, reduce score slightly
+                if (userHasParams && canonicalHasParams) {
+                    suffixScoreNoParams -= 0.15; // Reduce score when parameter info was ignored
+                    return (suffixScoreNoParams, $"Suffix match ignoring parameter types");
+                }
+                
+                return (suffixScoreNoParams, $"Suffix match without params");
+            }
 
             // Normalize generic arguments - keep the angle brackets but normalize contents
             // For example, "List<int>" and "List<T>" might be considered equivalent in some cases
@@ -411,6 +480,66 @@ namespace SharpTools.Tools.Services {
             // For non-method symbols, use the original full format
             return symbol.ToDisplayString(fqn).Replace(" ", string.Empty);
         }
+        /// <summary>
+        /// Checks if two parameter type names are equivalent, handling different formats like:
+        /// - System.Int32 vs int
+        /// - System.String vs string  
+        /// - System.Boolean vs bool
+        /// - etc.
+        /// </summary>
+        private static bool AreParameterTypesEquivalent(string userParamType, string canonicalParamType) {
+            // Normalize both types for comparison
+            var normalizedUserType = NormalizeParameterType(userParamType);
+            var normalizedCanonicalType = NormalizeParameterType(canonicalParamType);
+            
+            return normalizedUserType.Equals(normalizedCanonicalType, StringComparison.OrdinalIgnoreCase);
+        }
+        
+        /// <summary>
+        /// Normalizes parameter type names to handle different representations
+        /// </summary>
+        private static string NormalizeParameterType(string paramType) {
+            if (string.IsNullOrWhiteSpace(paramType)) return "";
+            
+            // Map common type aliases to their canonical forms
+            var typeMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) {
+                { "System.Int32", "int" },
+                { "System.String", "string" },
+                { "System.Boolean", "bool" },
+                { "System.Double", "double" },
+                { "System.Single", "float" },
+                { "System.Int64", "long" },
+                { "System.Int16", "short" },
+                { "System.Byte", "byte" },
+                { "System.SByte", "sbyte" },
+                { "System.UInt32", "uint" },
+                { "System.UInt64", "ulong" },
+                { "System.UInt16", "ushort" },
+                { "System.Char", "char" },
+                { "System.Decimal", "decimal" },
+                { "System.Object", "object" },
+                { "System.Void", "void" }
+            };
+            
+            var trimmed = paramType.Trim();
+            
+            // If it's a known type alias, normalize it
+            if (typeMap.ContainsKey(trimmed)) {
+                return typeMap[trimmed];
+            }
+            
+            // If it's already a C# keyword, check reverse mapping
+            var reverseMapping = typeMap.Where(kvp => kvp.Value.Equals(trimmed, StringComparison.OrdinalIgnoreCase))
+                                        .Select(kvp => kvp.Key)
+                                        .FirstOrDefault();
+            if (reverseMapping != null) {
+                return typeMap[reverseMapping]; // Return the canonical form (keyword)
+            }
+            
+            // For other types, return as-is but trimmed
+            return trimmed;
+        }
+
         private async Task LogAmbiguityDetailsAsync(string fuzzyFqnInput, List<FuzzyMatchResult> results, CancellationToken cancellationToken) {
             const double HighScoreThreshold = 0.8; // Threshold for considering a match "high-scoring"
             const int MaxDetailedLogsPerAmbiguity = 10; // Limit detailed logs to prevent spam

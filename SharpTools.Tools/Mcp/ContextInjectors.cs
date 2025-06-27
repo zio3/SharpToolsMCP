@@ -6,6 +6,7 @@ using Microsoft.CodeAnalysis.Text;
 using Microsoft.Extensions.Logging;
 using SharpTools.Tools.Interfaces;
 using SharpTools.Tools.Mcp.Tools;
+using SharpTools.Tools.Mcp.Models;
 namespace SharpTools.Tools.Mcp;
 /// <summary>
 /// Provides reusable context injection methods for checking compilation errors and generating diffs.
@@ -338,5 +339,219 @@ internal static class ContextInjectors {
         // Check if the assembly is from source code (part of the solution)
         // Assemblies in the solution have source code locations, while referenced assemblies don't
         return assembly.Locations.Any(loc => loc.IsInSource);
+    }
+
+    /// <summary>
+    /// Checks for compilation errors and returns structured diagnostics.
+    /// </summary>
+    public static async Task<CompilationDiagnostics> CheckCompilationErrorsStructuredAsync<TLogCategory>(
+        ISolutionManager solutionManager,
+        Document document,
+        ILogger<TLogCategory> logger,
+        CancellationToken cancellationToken)
+    {
+        var result = new CompilationDiagnostics();
+
+        if (document == null)
+        {
+            logger.LogWarning("Cannot check for compilation errors: Document is null");
+            return result;
+        }
+
+        try
+        {
+            var project = document.Project;
+            if (project == null)
+            {
+                logger.LogWarning("Cannot check for compilation errors: Project not found for document {FilePath}",
+                    document.FilePath ?? "unknown");
+                return result;
+            }
+
+            var compilation = await solutionManager.GetCompilationAsync(project.Id, cancellationToken);
+            if (compilation == null)
+            {
+                logger.LogWarning("Cannot check for compilation errors: Compilation not available for project {ProjectName}",
+                    project.Name);
+                return result;
+            }
+
+            var syntaxTree = await document.GetSyntaxTreeAsync(cancellationToken);
+            if (syntaxTree == null)
+            {
+                logger.LogWarning("Cannot check for compilation errors: Syntax tree not available for document {FilePath}",
+                    document.FilePath ?? "unknown");
+                return result;
+            }
+
+            var semanticModel = compilation.GetSemanticModel(syntaxTree);
+            var diagnostics = semanticModel.GetDiagnostics(cancellationToken: cancellationToken)
+                .Where(d => d.Severity == DiagnosticSeverity.Error || d.Severity == DiagnosticSeverity.Warning)
+                .OrderByDescending(d => d.Severity)
+                .ThenBy(d => d.Location.SourceSpan.Start)
+                .ToList();
+
+            result.ErrorCount = diagnostics.Count(d => d.Severity == DiagnosticSeverity.Error);
+            result.WarningCount = diagnostics.Count(d => d.Severity == DiagnosticSeverity.Warning);
+            result.HasErrors = result.ErrorCount > 0;
+
+            foreach (var diag in diagnostics)
+            {
+                var detail = await CreateDiagnosticDetail(diag, document, cancellationToken);
+                result.Diagnostics.Add(detail);
+            }
+
+            // Add general suggested actions
+            if (result.HasErrors)
+            {
+                result.SuggestedActions.Add($"構文エラーがある場合は {ToolHelpers.SharpToolPrefix}{nameof(ModificationTools.FindAndReplace)} を使用して修正してください");
+                
+                var memberAccessErrors = result.Diagnostics.Where(d => 
+                    d.Id == "CS0103" || d.Id == "CS1061" || d.Id == "CS0117" || d.Id == "CS0246").ToList();
+                if (memberAccessErrors.Any())
+                {
+                    result.SuggestedActions.Add("メンバーアクセスエラーは、using文の追加や名前空間の確認が必要な場合があります");
+                }
+            }
+
+            logger.LogWarning("Compilation issues found in {FilePath}: {ErrorCount} errors, {WarningCount} warnings",
+                document.FilePath ?? "unknown", result.ErrorCount, result.WarningCount);
+
+            return result;
+        }
+        catch (Exception ex) when (!(ex is OperationCanceledException))
+        {
+            logger.LogError(ex, "Error checking for compilation errors in document {FilePath}",
+                document.FilePath ?? "unknown");
+            result.Diagnostics.Add(new DiagnosticDetail
+            {
+                Id = "InternalError",
+                Severity = "Error",
+                Category = "internal",
+                Message = $"コンパイルエラーチェック中にエラーが発生しました: {ex.Message}"
+            });
+            return result;
+        }
+    }
+
+    private static async Task<DiagnosticDetail> CreateDiagnosticDetail(
+        Diagnostic diagnostic,
+        Document document,
+        CancellationToken cancellationToken)
+    {
+        var detail = new DiagnosticDetail
+        {
+            Id = diagnostic.Id,
+            Severity = diagnostic.Severity.ToString(),
+            Category = GetDiagnosticCategory(diagnostic.Id),
+            Message = diagnostic.GetMessage()
+        };
+
+        // Get location info
+        if (diagnostic.Location.IsInSource)
+        {
+            var lineSpan = diagnostic.Location.GetLineSpan();
+            detail.Location = new DiagnosticLocation
+            {
+                FilePath = document.FilePath ?? "",
+                Line = lineSpan.StartLinePosition.Line + 1,
+                Column = lineSpan.StartLinePosition.Character + 1,
+                EndLine = lineSpan.EndLinePosition.Line + 1,
+                EndColumn = lineSpan.EndLinePosition.Character + 1
+            };
+
+            // Try to get code snippet
+            try
+            {
+                var text = await document.GetTextAsync(cancellationToken);
+                var line = text.Lines[lineSpan.StartLinePosition.Line];
+                detail.Location.CodeSnippet = line.ToString();
+            }
+            catch
+            {
+                // Best effort - ignore if we can't get the snippet
+            }
+        }
+
+        // Add suggested actions based on error type
+        detail.SuggestedActions = GetSuggestedActions(diagnostic);
+        detail.CanAutoFix = CanAutoFix(diagnostic.Id);
+
+        // Add related locations if any
+        foreach (var additionalLocation in diagnostic.AdditionalLocations)
+        {
+            var relatedLineSpan = additionalLocation.GetLineSpan();
+            detail.RelatedLocations.Add(new DiagnosticLocation
+            {
+                FilePath = relatedLineSpan.Path,
+                Line = relatedLineSpan.StartLinePosition.Line + 1,
+                Column = relatedLineSpan.StartLinePosition.Character + 1
+            });
+        }
+
+        return detail;
+    }
+
+    internal static string GetDiagnosticCategory(string diagnosticId)
+    {
+        return diagnosticId switch
+        {
+            "CS0103" => "name-not-found",
+            "CS1061" => "member-not-found",
+            "CS0117" => "member-not-defined",
+            "CS0246" => "type-not-found",
+            "CS1002" => "syntax",
+            "CS1003" => "syntax",
+            "CS1519" => "syntax",
+            "CS1520" => "syntax",
+            "CS0029" => "type-conversion",
+            "CS0266" => "type-conversion",
+            "CS0161" => "return-path",
+            "CS0165" => "unassigned-variable",
+            _ when diagnosticId.StartsWith("CS1") => "syntax",
+            _ when diagnosticId.StartsWith("CS0") => "semantic",
+            _ => "other"
+        };
+    }
+
+    private static List<string> GetSuggestedActions(Diagnostic diagnostic)
+    {
+        var actions = new List<string>();
+
+        switch (diagnostic.Id)
+        {
+            case "CS0103": // Name not found
+                actions.Add("using文を追加してください");
+                actions.Add("名前空間を確認してください");
+                actions.Add("タイプミスがないか確認してください");
+                break;
+            case "CS1061": // Member not found
+                actions.Add("メンバー名を確認してください");
+                actions.Add("対象の型が正しいか確認してください");
+                actions.Add("必要な拡張メソッドのusing文を追加してください");
+                break;
+            case "CS0246": // Type not found
+                actions.Add("using文を追加してください");
+                actions.Add("参照アセンブリを確認してください");
+                actions.Add("NuGetパッケージが必要な可能性があります");
+                break;
+            case "CS1002": // ; expected
+            case "CS1003": // Syntax error
+                actions.Add("構文を確認してください");
+                actions.Add($"{ToolHelpers.SharpToolPrefix}{nameof(ModificationTools.FindAndReplace)} で修正してください");
+                break;
+        }
+
+        return actions;
+    }
+
+    private static bool CanAutoFix(string diagnosticId)
+    {
+        return diagnosticId switch
+        {
+            "CS1002" => true, // ; expected
+            "CS1003" => true, // Simple syntax errors
+            _ => false
+        };
     }
 }

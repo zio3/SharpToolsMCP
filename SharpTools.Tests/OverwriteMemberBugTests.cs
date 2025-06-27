@@ -109,16 +109,25 @@ namespace SharpTools.Tests.TestData
 {
     public class OverloadTestClass
     {
+        /// <summary>
+        /// 文字列を処理するメソッド
+        /// </summary>
         public string Process(string input)
         {
             return $""String: {input}"";
         }
 
+        /// <summary>
+        /// 整数を処理するメソッド
+        /// </summary>
         public string Process(int input)
         {
             return $""Int: {input}"";
         }
 
+        /// <summary>
+        /// 浮動小数点数を処理するメソッド
+        /// </summary>
         public string Process(double input)
         {
             return $""Double: {input}"";
@@ -195,10 +204,11 @@ projectFile,
 CancellationToken.None);
 
 // Int版のメソッドが正確に返されることを確認
-Assert.IsTrue(result.Contains("Process(int input)"), 
-$"Expected int version but got: {result}");
-Assert.IsTrue(result.Contains("整数を処理するメソッド") || result.Contains("Int:"), 
-$"Expected int version documentation but got: {result}");
+var resultJson = result?.ToString() ?? "";
+Assert.IsTrue(resultJson.Contains("Process(int input)"), 
+$"Expected int version but got: {resultJson}");
+Assert.IsTrue(resultJson.Contains("整数を処理するメソッド") || resultJson.Contains("Int:"), 
+$"Expected int version documentation but got: {resultJson}");
 }
 catch (Exception ex)
 {
@@ -240,11 +250,13 @@ _logger,
 testFile,
 "SharpTools.Tests.TestData.OverloadTestClass.Process(System.Int32)",
 newMethodCode,
+null, // userConfirmResponse
 CancellationToken.None);
 
 // Assert - 正常に完了したことを確認
-Assert.IsTrue(result.Contains("正常に置換しました"), 
-$"Expected successful replacement but got: {result}");
+var resultStr = result?.ToString() ?? "";
+Assert.IsTrue(resultStr.Contains("正常に置換しました"), 
+$"Expected successful replacement but got: {resultStr}");
 
 // ファイル内容を確認して、正しいメソッドが更新されたかチェック
 var updatedContent = File.ReadAllText(testFile);
@@ -258,8 +270,9 @@ Assert.IsTrue(updatedContent.Contains("String: {input}"),
 "String version should remain unchanged");
 
 // 重複メソッドがないことを確認（コンパイルエラーがない）
-Assert.IsFalse(result.Contains("Compilation errors detected"), 
-$"Should not have compilation errors but got: {result}");
+var resultStr2 = result?.ToString() ?? "";
+Assert.IsFalse(resultStr2.Contains("Compilation errors detected"), 
+$"Should not have compilation errors but got: {resultStr2}");
 }
 catch (Exception ex)
 {
@@ -299,6 +312,7 @@ _logger,
 testFile,
 "PublicMethod",
 newMethodCode,
+null, // userConfirmResponse
 CancellationToken.None);
 
 // Assert - ファイル内容を確認
@@ -352,6 +366,7 @@ _logger,
 testFile,
 "PrivateMethod",
 newMethodCode,
+null, // userConfirmResponse
 CancellationToken.None);
 
 // Assert
@@ -401,11 +416,13 @@ _logger,
 testFile,
 "StaticMethod",
 newMethodCode,
+null, // userConfirmResponse
 CancellationToken.None);
 
 // 成功することを確認
-Assert.IsTrue(result.Contains("正常に置換しました"), 
-$"Expected successful replacement with simple method name but got: {result}");
+var resultStr3 = result?.ToString() ?? "";
+Assert.IsTrue(resultStr3.Contains("正常に置換しました"), 
+$"Expected successful replacement with simple method name but got: {resultStr3}");
 }
 catch (Exception ex)
 {
@@ -441,6 +458,7 @@ _logger,
 testFile,
 "PublicMethod",
 incompleteMethodCode,
+null, // userConfirmResponse
 CancellationToken.None);
 
 // 安全性警告が表示されることを期待

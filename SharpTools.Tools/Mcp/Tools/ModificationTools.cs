@@ -21,6 +21,9 @@ using SharpTools.Tools.Interfaces;
 using SharpTools.Tools.Mcp;
 using SharpTools.Tools.Services;
 
+using SharpTools.Tools.Mcp.Models;
+using SharpTools.Tools.Mcp.Helpers;
+
 namespace SharpTools.Tools.Mcp.Tools;
 
 // Marker class for ILogger<T> category specific to ModificationTools
@@ -28,6 +31,62 @@ public class ModificationToolsLogCategory { }
 
 [McpServerToolType]
 public static class ModificationTools {
+    private static string GetMemberTypeName(SyntaxNode node) {
+        return node switch {
+            MethodDeclarationSyntax => "Method",
+            PropertyDeclarationSyntax => "Property",
+            FieldDeclarationSyntax => "Field",
+            ConstructorDeclarationSyntax => "Constructor",
+            DestructorDeclarationSyntax => "Destructor",
+            OperatorDeclarationSyntax => "Operator",
+            ConversionOperatorDeclarationSyntax => "ConversionOperator",
+            EventDeclarationSyntax => "Event",
+            EventFieldDeclarationSyntax => "EventField",
+            IndexerDeclarationSyntax => "Indexer",
+            EnumDeclarationSyntax => "Enum",
+            ClassDeclarationSyntax => "Class",
+            StructDeclarationSyntax => "Struct",
+            InterfaceDeclarationSyntax => "Interface",
+            RecordDeclarationSyntax => "Record",
+            DelegateDeclarationSyntax => "Delegate",
+            NamespaceDeclarationSyntax => "Namespace",
+            FileScopedNamespaceDeclarationSyntax => "FileScopedNamespace",
+            _ => node.GetType().Name.Replace("DeclarationSyntax", "").Replace("Syntax", "")
+        };
+    }
+    
+    private static string GetMemberSignature(MemberDeclarationSyntax member) {
+        return member switch {
+            MethodDeclarationSyntax method => $"{method.Modifiers} {method.ReturnType} {method.Identifier}{method.ParameterList}".Trim(),
+            PropertyDeclarationSyntax property => $"{property.Modifiers} {property.Type} {property.Identifier}".Trim(),
+            FieldDeclarationSyntax field => $"{field.Modifiers} {field.Declaration}".Trim(),
+            _ => member.ToString().Split('\n')[0].Trim() // First line for others
+        };
+    }
+    
+    private static string GetAccessibility(MemberDeclarationSyntax member) {
+        var modifiers = member.Modifiers;
+        if (modifiers.Any(m => m.IsKind(SyntaxKind.PublicKeyword))) return "Public";
+        if (modifiers.Any(m => m.IsKind(SyntaxKind.PrivateKeyword))) return "Private";
+        if (modifiers.Any(m => m.IsKind(SyntaxKind.ProtectedKeyword))) {
+            if (modifiers.Any(m => m.IsKind(SyntaxKind.InternalKeyword))) return "ProtectedInternal";
+            return "Protected";
+        }
+        if (modifiers.Any(m => m.IsKind(SyntaxKind.InternalKeyword))) return "Internal";
+        return "Private"; // Default for C#
+    }
+    
+    private static string GetReturnType(MemberDeclarationSyntax member) {
+        return member switch {
+            MethodDeclarationSyntax method => method.ReturnType?.ToString() ?? "void",
+            PropertyDeclarationSyntax property => property.Type?.ToString() ?? "unknown",
+            FieldDeclarationSyntax field => field.Declaration.Type?.ToString() ?? "unknown",
+            EventDeclarationSyntax evt => evt.Type?.ToString() ?? "unknown",
+            EventFieldDeclarationSyntax evtField => evtField.Declaration.Type?.ToString() ?? "unknown",
+            _ => ""
+        };
+    }
+    
     private static string GetMemberName(MemberDeclarationSyntax memberSyntax) {
         return memberSyntax switch {
             MethodDeclarationSyntax method => method.Identifier.Text,
@@ -522,25 +581,29 @@ public static class ModificationTools {
     #region Main Methods
 
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(AddMember), Idempotent = false, Destructive = false, OpenWorld = false, ReadOnly = false)]
-    [Description("Safely add new members (methods, properties, fields, etc.) to a specified type with automatic duplicate checking and compilation error validation")]
-    public static async Task<string> AddMember(
+    [Description("🔍 .NET専用 - .cs/.csprojファイルのみ対応。クラスにメンバー（メソッド、プロパティ、フィールド）を追加")]
+    public static async Task<object> AddMember(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
         ICodeAnalysisService codeAnalysisService,
         IComplexityAnalysisService complexityAnalysisService,
         ISemanticSimilarityService semanticSimilarityService,
         ILogger<ModificationToolsLogCategory> logger,
-        [Description("Path to the file containing the target type.")] string filePath,
-        [Description("The C# code to add. Include complete member definition (e.g., public string Name { get; set; })")] string codeSnippet,
-        [Description("Target type name for files with multiple types (e.g., 'MyClass'). Leave empty for single-type files.")] string targetTypeName = "",
-        [Description("Optional file name hint for partial types. Use 'auto' to determine automatically.")] string fileNameHint = "auto",
-        [Description("Suggest a line number to insert the member near. '-1' to determine automatically.")] int lineNumberHint = -1,
+        [Description("C#ファイル(.cs)の絶対パス")] string filePath,
+        [Description("Complete member definition(s). Can contain multiple members separated by proper C# syntax")] string memberCode,
+        [Description("Target class name ('auto' for single-class files)")] string className = "auto",
+        [Description("Insertion position ('end', 'beginning', line number, or 'after:MemberName')")] string insertPosition = "end",
+        [Description("File name hint for partial types ('auto' to determine automatically)")] string fileNameHint = "auto",
+        [Description("追加するusing文のリスト（重複は自動的にスキップされます）")] string[]? appendUsings = null,
         CancellationToken cancellationToken = default) {
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            // 🔍 .NET関連ファイル検証（最優先実行）
+            CSharpFileValidationHelper.ValidateDotNetFileForRoslyn(filePath, nameof(AddMember), logger);
+            
             // Validate parameters
             ErrorHandlingHelpers.ValidateStringParameter(filePath, "filePath", logger);
-            ErrorHandlingHelpers.ValidateStringParameter(codeSnippet, "codeSnippet", logger);
-            codeSnippet = codeSnippet.TrimBackslash();
+            ErrorHandlingHelpers.ValidateStringParameter(memberCode, "memberCode", logger);
+            memberCode = memberCode.TrimBackslash();
 
             if (!File.Exists(filePath)) {
                 throw new McpException($"📁 ファイルが見つかりません: {filePath}\n💡 確認方法:\n• パスが正しいかを確認（絶対パス推奨）\n• {ToolHelpers.SharpToolPrefix}ReadTypesFromRoslynDocument で構造を確認");
@@ -556,16 +619,30 @@ public static class ModificationTools {
                     throw new McpException($"File {filePath} not found in the project");
                 }
 
-                // Parse the code snippet
-                MemberDeclarationSyntax? memberSyntax;
+                // Parse the member code - support multiple members
+                List<MemberDeclarationSyntax> memberSyntaxList = new();
                 try {
-                    memberSyntax = SyntaxFactory.ParseMemberDeclaration(codeSnippet);
-                    if (memberSyntax == null) {
-                        throw new McpException("Failed to parse code snippet as a valid member declaration.");
+                    // Always try to parse as multiple members by wrapping in a class
+                    var wrappedCode = $"class TempClass {{ {memberCode} }}";
+                    var compilationUnit = SyntaxFactory.ParseCompilationUnit(wrappedCode);
+                    var tempClass = compilationUnit.DescendantNodes().OfType<ClassDeclarationSyntax>().FirstOrDefault();
+                    
+                    if (tempClass != null && tempClass.Members.Any()) {
+                        memberSyntaxList.AddRange(tempClass.Members);
+                    } else {
+                        // If that fails, try to parse as a single member
+                        var singleMember = SyntaxFactory.ParseMemberDeclaration(memberCode);
+                        if (singleMember != null) {
+                            memberSyntaxList.Add(singleMember);
+                        }
+                    }
+                    
+                    if (!memberSyntaxList.Any()) {
+                        throw new McpException("Failed to parse member code as valid member declaration(s).");
                     }
                 } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
-                    logger.LogError(ex, "Failed to parse code snippet as member declaration");
-                    throw new McpException($"Invalid C# syntax in code snippet: {ex.Message}");
+                    logger.LogError(ex, "Failed to parse member code");
+                    throw new McpException($"Invalid C# syntax in member code: {ex.Message}");
                 }
 
                 // Get the semantic model
@@ -574,14 +651,23 @@ public static class ModificationTools {
                     throw new McpException("Failed to get semantic model for the document");
                 }
 
+                // Capture before operation diagnostics
+                var beforeCompilation = await project.GetCompilationAsync(cancellationToken);
+                var beforeDiagnostics = beforeCompilation != null 
+                    ? await DiagnosticHelper.CaptureDiagnosticsAsync(
+                        beforeCompilation, 
+                        "操作前から存在していた診断", 
+                        cancellationToken)
+                    : null;
+
                 // Find the target type in the document
                 var root = await document.GetSyntaxRootAsync(cancellationToken);
                 if (root == null) {
                     throw new McpException("Failed to get syntax root for the document");
                 }
 
-                // Extract member name from the syntax
-                string memberName = GetMemberName(memberSyntax);
+                // We'll process member names individually later
+                // string memberName = GetMemberName(memberSyntax);
 
                 // Find all type declarations in the file
                 var typeDeclarations = root.DescendantNodes().OfType<TypeDeclarationSyntax>().ToList();
@@ -601,17 +687,17 @@ public static class ModificationTools {
                     }
                     targetTypeSymbol = namedTypeSymbol;
                 } else {
-                    // Multiple types - check if targetTypeName is provided
-                    if (string.IsNullOrWhiteSpace(targetTypeName)) {
+                    // Multiple types - check if className is provided
+                    if (string.IsNullOrWhiteSpace(className) || className == "auto") {
                         var typeNames = string.Join(", ", typeDeclarations.Select(t => t.Identifier.Text));
-                        throw new McpException($"⚠️ 複数の型定義が見つかりました: {typeNames}\n💡 対応方法:\n• targetTypeName パラメータで対象の型を指定してください\n• 例: targetTypeName: \"MyClass\"\n• {ToolHelpers.SharpToolPrefix}ReadTypesFromRoslynDocument で型一覧を確認");
+                        throw new McpException($"複数の型定義が見つかりました: {typeNames}\n対応方法:\n• className パラメータで対象の型を指定してください\n• 例: className: \"MyClass\"\n• {ToolHelpers.SharpToolPrefix}ReadTypesFromRoslynDocument で型一覧を確認");
                     }
                     
                     // Find the target type by name
-                    targetTypeNode = typeDeclarations.FirstOrDefault(t => t.Identifier.Text == targetTypeName)!;
+                    targetTypeNode = typeDeclarations.FirstOrDefault(t => t.Identifier.Text == className)!;
                     if (targetTypeNode == null) {
                         var availableTypes = string.Join(", ", typeDeclarations.Select(t => t.Identifier.Text));
-                        throw new McpException($"⚠️ 指定された型 '{targetTypeName}' が見つかりません\n利用可能な型: {availableTypes}");
+                        throw new McpException($"指定された型 '{className}' が見つかりません\n利用可能な型: {availableTypes}");
                     }
                     
                     var symbol = semanticModel.GetDeclaredSymbol(targetTypeNode);
@@ -621,36 +707,143 @@ public static class ModificationTools {
                     targetTypeSymbol = namedTypeSymbol;
                 }
 
-                // Check for duplicate members
-                if (!IsMemberAllowed(targetTypeSymbol, memberSyntax, memberName, cancellationToken)) {
-                    throw new McpException($"A member with the name '{memberName}' already exists in '{targetTypeSymbol.ToDisplayString()}'" +
-                        (memberSyntax is MethodDeclarationSyntax ? " with the same parameter signature." : "."));
-                }
-
-                // Add the member using DocumentEditor directly
-                var editor = await DocumentEditor.CreateAsync(document, cancellationToken);
-
-                // Format the new member with proper indentation
-                var formattedMember = memberSyntax.NormalizeWhitespace();
-
-                // Special handling for interface members
-                if (targetTypeNode is InterfaceDeclarationSyntax && memberSyntax is MethodDeclarationSyntax methodDecl) {
-                    // Interface methods should not have bodies
-                    if (methodDecl.Body != null || methodDecl.ExpressionBody != null) {
-                        // Remove body and expression body, add semicolon
-                        formattedMember = methodDecl
-                            .WithBody(null)
-                            .WithExpressionBody(null)
-                            .WithSemicolonToken(SyntaxFactory.Token(SyntaxKind.SemicolonToken))
-                            .NormalizeWhitespace();
+                // Check for duplicate members for each member
+                foreach (var memberSyntax in memberSyntaxList) {
+                    var memberName = GetMemberName(memberSyntax);
+                    if (!IsMemberAllowed(targetTypeSymbol, memberSyntax, memberName, cancellationToken)) {
+                        throw new McpException($"A member with the name '{memberName}' already exists in '{targetTypeSymbol.ToDisplayString()}'" +
+                            (memberSyntax is MethodDeclarationSyntax ? " with the same parameter signature." : "."));
                     }
                 }
 
-                // Add the member to the type
-                editor.AddMember(targetTypeNode, formattedMember);
+                // Add the members using DocumentEditor
+                var editor = await DocumentEditor.CreateAsync(document, cancellationToken);
+                var addedMembers = new List<AddedMember>();
+                var originalRoot = await document.GetSyntaxRootAsync(cancellationToken);
+                
+                // Process each member
+                foreach (var memberSyntax in memberSyntaxList) {
+                    var memberName = GetMemberName(memberSyntax);
+                    var formattedMember = memberSyntax.NormalizeWhitespace();
 
-                // Get the changed document and format it
+                    // Special handling for interface members
+                    bool wasBodyRemoved = false;
+                    if (targetTypeNode is InterfaceDeclarationSyntax && memberSyntax is MethodDeclarationSyntax methodDecl) {
+                        // Interface methods should not have bodies
+                        if (methodDecl.Body != null || methodDecl.ExpressionBody != null) {
+                            // Remove body and expression body, add semicolon
+                            formattedMember = methodDecl
+                                .WithBody(null)
+                                .WithExpressionBody(null)
+                                .WithSemicolonToken(SyntaxFactory.Token(SyntaxKind.SemicolonToken))
+                                .NormalizeWhitespace();
+                            wasBodyRemoved = true;
+                            logger.LogWarning("Method body was removed because interface methods cannot have implementations");
+                        }
+                    }
+
+                    // Add the member to the type
+                    editor.AddMember(targetTypeNode, formattedMember);
+                    
+                    // Create AddedMember info (we'll update with more details after changes are applied)
+                    var addedMember = new AddedMember {
+                        Name = memberName,
+                        Type = GetMemberTypeName(memberSyntax),
+                        Signature = GetMemberSignature(memberSyntax),
+                        Accessibility = GetAccessibility(memberSyntax),
+                        ReturnType = GetReturnType(memberSyntax)
+                    };
+                    
+                    // Add parameters for methods
+                    if (memberSyntax is MethodDeclarationSyntax method) {
+                        foreach (var param in method.ParameterList.Parameters) {
+                            addedMember.Parameters.Add(new ParameterDetail {
+                                Name = param.Identifier.Text,
+                                Type = param.Type?.ToString() ?? "unknown",
+                                IsOptional = param.Default != null,
+                                DefaultValue = param.Default?.Value?.ToString()
+                            });
+                        }
+                    }
+                    
+                    addedMembers.Add(addedMember);
+                }
+
+                // Get the changed document first (with members added)
                 var changedDocument = editor.GetChangedDocument();
+
+                // Handle using directives if specified
+                var addedUsings = new List<string>();
+                var usingConflicts = new List<string>();
+
+                if (appendUsings != null && appendUsings.Length > 0) {
+                    // Create a new editor for the document with members already added
+                    var usingEditor = await DocumentEditor.CreateAsync(changedDocument, cancellationToken);
+                    var currentRoot = await changedDocument.GetSyntaxRootAsync(cancellationToken);
+                    
+                    if (currentRoot is CompilationUnitSyntax compilationUnit) {
+                        // Get existing using directives
+                        var existingUsings = compilationUnit.Usings.Select(u => u.Name?.ToString()).Where(u => u != null).ToHashSet();
+                        
+                        // Process each using to add
+                        foreach (var usingToAdd in appendUsings) {
+                            if (string.IsNullOrWhiteSpace(usingToAdd)) continue;
+                            
+                            // Normalize the using (remove "using" keyword and semicolon if present)
+                            var normalizedUsing = usingToAdd.Trim();
+                            if (normalizedUsing.StartsWith("using ")) {
+                                normalizedUsing = normalizedUsing.Substring(6).Trim();
+                            }
+                            if (normalizedUsing.EndsWith(";")) {
+                                normalizedUsing = normalizedUsing.TrimEnd(';').Trim();
+                            }
+                            
+                            // Check if already exists
+                            if (existingUsings.Contains(normalizedUsing)) {
+                                usingConflicts.Add(normalizedUsing);
+                                logger.LogDebug("Using directive '{Using}' already exists, skipping", normalizedUsing);
+                            } else {
+                                // Create the using directive
+                                var usingDirective = SyntaxFactory.UsingDirective(SyntaxFactory.ParseName(normalizedUsing))
+                                    .WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed);
+                                
+                                // Add using in sorted order
+                                var inserted = false;
+                                for (int i = 0; i < compilationUnit.Usings.Count; i++) {
+                                    var existingUsing = compilationUnit.Usings[i];
+                                    if (string.Compare(normalizedUsing, existingUsing.Name?.ToString(), StringComparison.Ordinal) < 0) {
+                                        usingEditor.InsertBefore(existingUsing, usingDirective);
+                                        inserted = true;
+                                        break;
+                                    }
+                                }
+                                
+                                if (!inserted) {
+                                    if (compilationUnit.Usings.Any()) {
+                                        usingEditor.InsertAfter(compilationUnit.Usings.Last(), usingDirective);
+                                    } else {
+                                        // No existing usings - add before first member or extern alias
+                                        var firstNode = compilationUnit.ChildNodes().FirstOrDefault(n => 
+                                            n is MemberDeclarationSyntax || n is ExternAliasDirectiveSyntax);
+                                        if (firstNode != null) {
+                                            usingEditor.InsertBefore(firstNode, usingDirective);
+                                        }
+                                    }
+                                }
+                                
+                                addedUsings.Add(normalizedUsing);
+                                logger.LogInformation("Added using directive: {Using}", normalizedUsing);
+                            }
+                        }
+                        
+                        // Get the document with usings added
+                        if (addedUsings.Any()) {
+                            changedDocument = usingEditor.GetChangedDocument();
+                        }
+                    }
+                }
+
+                // Format the final document
                 var formattedDocument = await Formatter.FormatAsync(changedDocument, options: null, cancellationToken);
 
                 // Apply changes to the workspace
@@ -670,205 +863,88 @@ public static class ModificationTools {
                     throw new McpException("Failed to get compilation for error checking");
                 }
 
-                var diagnostics = compilation.GetDiagnostics(cancellationToken)
-                    .Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error)
-                    .Take(10)
-                    .ToList();
-
-                string errorMessages = "";
-                if (diagnostics.Any()) {
-                    errorMessages = string.Join("\n", diagnostics.Select(d => $"- {d.GetMessage()}"));
-                }
-
-                // Perform complexity analysis if possible
-                string analysisResults = string.Empty;
+                // Get updated document for analysis
                 var updatedSemanticModel = await updatedDocument.GetSemanticModelAsync(cancellationToken);
-                if (updatedSemanticModel != null) {
-                    var updatedRoot = await updatedDocument.GetSyntaxRootAsync(cancellationToken);
-                    if (updatedRoot != null) {
-                        var addedMemberNode = updatedRoot.DescendantNodes()
-                            .OfType<MemberDeclarationSyntax>()
-                            .Where(m => m is not NamespaceDeclarationSyntax && m is not FileScopedNamespaceDeclarationSyntax)
-                            .FirstOrDefault(m => GetMemberName(m) == memberName && m.IsKind(memberSyntax.Kind()));
-
-                        if (addedMemberNode != null) {
-                            var addedSymbol = updatedSemanticModel.GetDeclaredSymbol(addedMemberNode);
-                            if (addedSymbol != null) {
-                                analysisResults = await MemberAnalysisHelper.AnalyzeAddedMemberAsync(
-                                    addedSymbol, complexityAnalysisService, semanticSimilarityService, logger, cancellationToken);
+                var updatedRoot = await updatedDocument.GetSyntaxRootAsync(cancellationToken);
+                
+                // Update line numbers for added members
+                if (updatedRoot != null) {
+                    var updatedTypeNode = updatedRoot.DescendantNodes()
+                        .OfType<TypeDeclarationSyntax>()
+                        .FirstOrDefault(t => t.Identifier.Text == targetTypeNode.Identifier.Text);
+                    
+                    if (updatedTypeNode != null) {
+                        foreach (var addedMember in addedMembers) {
+                            var memberNode = updatedTypeNode.Members
+                                .FirstOrDefault(m => GetMemberName(m) == addedMember.Name);
+                            
+                            if (memberNode != null) {
+                                var lineSpan = memberNode.GetLocation().GetLineSpan();
+                                addedMember.InsertedAtLine = lineSpan.StartLinePosition.Line + 1;
                             }
                         }
                     }
                 }
 
-                string baseMessage = $"✅ メンバーを正常に追加しました to {targetTypeSymbol.ToDisplayString()} in {filePath}.\n\n" +
-                    (string.IsNullOrEmpty(errorMessages) ? "<errorCheck>No compilation issues detected.</errorCheck>" :
-                    ($"<errorCheck>Compilation errors detected:\n{errorMessages}</errorCheck>\n\n" +
-                    $"If you choose to fix these issues, you must use {ToolHelpers.SharpToolPrefix + nameof(OverwriteMember)} to replace the member with a new definition."));
+                // Create statistics
+                var statistics = new MemberStatistics {
+                    TotalAdded = addedMembers.Count,
+                    MethodCount = addedMembers.Count(m => m.Type == "Method"),
+                    PropertyCount = addedMembers.Count(m => m.Type == "Property"),
+                    FieldCount = addedMembers.Count(m => m.Type == "Field"),
+                    EventCount = addedMembers.Count(m => m.Type == "Event" || m.Type == "EventField")
+                };
+                
+                // Return structured result
+                var result = new AddMemberResult {
+                    Success = true,
+                    TargetClass = targetTypeSymbol.ToDisplayString(),
+                    FilePath = filePath,
+                    AddedMembers = addedMembers,
+                    Statistics = statistics,
+                    InsertPosition = insertPosition,
+                    Message = $"{statistics.TotalAdded}個のメンバーを正常に追加しました",
+                    AddedUsings = addedUsings,
+                    UsingConflicts = usingConflicts
+                };
 
-                return string.IsNullOrWhiteSpace(analysisResults) ? baseMessage : $"{baseMessage}\n\n{analysisResults}";
+                // Add detailed compilation status
+                if (beforeCompilation != null && compilation != null) {
+                    result.CompilationStatus = await DiagnosticHelper.CreateDetailedStatusAsync(
+                        beforeCompilation,
+                        compilation,
+                        cancellationToken);
+                }
+
+                // Note: Complexity analysis removed from AddMember result as per new specification
+
+                return result;
+
             } finally {
                 workspace.Dispose();
             }
         }, logger, nameof(AddMember), cancellationToken);
     }
 
-    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(UpdateToolDescription), Idempotent = false, Destructive = false, OpenWorld = false, ReadOnly = false)]
-    [Description("🎯 Safely update only the Description attribute of a SharpTool method without touching the method body - SAFETY ENHANCED VERSION")]
-    public static async Task<string> UpdateToolDescription(
-        StatelessWorkspaceFactory workspaceFactory,
-        ICodeModificationService modificationService,
-        ILogger<ModificationToolsLogCategory> logger,
-        [Description("Path to the C# file containing the tool method")] string filePath,
-        [Description("The method name to update (e.g., 'GetMembers')")] string methodName,
-        [Description("The new description text (without [Description(...)] wrapper)")] string newDescription,
-        CancellationToken cancellationToken = default) {
-        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
-            ErrorHandlingHelpers.ValidateStringParameter(filePath, nameof(filePath), logger);
-            ErrorHandlingHelpers.ValidateStringParameter(methodName, nameof(methodName), logger);
-            ErrorHandlingHelpers.ValidateStringParameter(newDescription, nameof(newDescription), logger);
-
-            if (!File.Exists(filePath)) {
-                throw new McpException($"📁 ファイルが見つかりません: {filePath}\n💡 確認方法:\n• パスが正しいかを確認（絶対パス推奨）\n• {ToolHelpers.SharpToolPrefix}ReadTypesFromRoslynDocument で構造を確認");
-            }
-
-            logger.LogInformation("Executing '{UpdateToolDescription}' for method: {MethodName} in file: {FilePath}",
-                nameof(UpdateToolDescription), methodName, filePath);
-
-            var (workspace, project, document) = await workspaceFactory.CreateForFileAsync(filePath);
-
-            try {
-                if (document == null) {
-                    throw new McpException($"File {filePath} not found in the project");
-                }
-
-                var root = await document.GetSyntaxRootAsync(cancellationToken);
-                if (root == null) {
-                    throw new McpException("Failed to get syntax root for the document");
-                }
-
-                // Find the method by name
-                var methodNode = root.DescendantNodes()
-                    .OfType<MethodDeclarationSyntax>()
-                    .FirstOrDefault(m => m.Identifier.Text == methodName);
-
-                if (methodNode == null) {
-                    throw new McpException($"⚠️ Method '{methodName}' not found in file {filePath}");
-                }
-
-                // Check if it's a SharpTool method
-                var hasSharpToolAttribute = methodNode.AttributeLists
-                    .SelectMany(al => al.Attributes)
-                    .Any(a => a.Name.ToString().Contains("McpServerTool"));
-
-                if (!hasSharpToolAttribute) {
-                    throw new McpException($"⚠️ Method '{methodName}' is not a SharpTool (missing [McpServerTool] attribute)");
-                }
-
-                // Find existing Description attribute
-                AttributeSyntax? existingDescription = null;
-                AttributeListSyntax? containingList = null;
-
-                foreach (var attrList in methodNode.AttributeLists) {
-                    var descAttr = attrList.Attributes
-                        .FirstOrDefault(a => a.Name.ToString() == "Description");
-
-                    if (descAttr != null) {
-                        existingDescription = descAttr;
-                        containingList = attrList;
-                        break;
-                    }
-                }
-
-                SyntaxNode newRoot;
-
-                if (existingDescription != null) {
-                    // Update existing Description attribute
-                    var newDescriptionAttr = SyntaxFactory.Attribute(
-                        SyntaxFactory.IdentifierName("Description"),
-                        SyntaxFactory.AttributeArgumentList(
-                            SyntaxFactory.SingletonSeparatedList(
-                                SyntaxFactory.AttributeArgument(
-                                    SyntaxFactory.LiteralExpression(
-                                        SyntaxKind.StringLiteralExpression,
-                                        SyntaxFactory.Literal(newDescription)
-                                    )
-                                )
-                            )
-                        )
-                    );
-
-                    newRoot = root.ReplaceNode(existingDescription, newDescriptionAttr);
-                } else {
-                    // Add new Description attribute
-                    var newAttrList = SyntaxFactory.AttributeList(
-                        SyntaxFactory.SingletonSeparatedList(
-                            SyntaxFactory.Attribute(
-                                SyntaxFactory.IdentifierName("Description"),
-                                SyntaxFactory.AttributeArgumentList(
-                                    SyntaxFactory.SingletonSeparatedList(
-                                        SyntaxFactory.AttributeArgument(
-                                            SyntaxFactory.LiteralExpression(
-                                                SyntaxKind.StringLiteralExpression,
-                                                SyntaxFactory.Literal(newDescription)
-                                            )
-                                        )
-                                    )
-                                )
-                            )
-                        )
-                    );
-
-                    var newMethodNode = methodNode.AddAttributeLists(newAttrList);
-                    newRoot = root.ReplaceNode(methodNode, newMethodNode);
-                }
-
-                var newDocument = document.WithSyntaxRoot(newRoot);
-                
-                // Check if System.ComponentModel using is present
-                var compilationUnit = newRoot as CompilationUnitSyntax;
-                if (compilationUnit != null) {
-                    var hasComponentModelUsing = compilationUnit.Usings.Any(u => 
-                        u.Name?.ToString() == "System.ComponentModel");
-                    
-                    if (!hasComponentModelUsing) {
-                        // Add using directive
-                        var newUsing = SyntaxFactory.UsingDirective(
-                            SyntaxFactory.ParseName("System.ComponentModel"))
-                            .WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed);
-                        
-                        compilationUnit = compilationUnit.AddUsings(newUsing);
-                        newDocument = newDocument.WithSyntaxRoot(compilationUnit);
-                    }
-                }
-                
-                var formattedDocument = await modificationService.FormatDocumentAsync(newDocument, cancellationToken);
-
-                if (!workspace.TryApplyChanges(formattedDocument.Project.Solution)) {
-                    throw new McpException("Failed to apply changes to the workspace");
-                }
-
-                return $"✅ Successfully updated Description attribute for method '{methodName}' in {filePath}\n💡 注: using System.ComponentModel; が自動追加されました（必要な場合）";
-            } finally {
-                workspace.Dispose();
-            }
-        }, logger, nameof(UpdateToolDescription), cancellationToken);
-    }
 
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(OverwriteMember), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("⚠️ [DESTRUCTIVE] Completely replaces an existing member. Always use GetMethodSignature to check current implementation first. Incomplete code risks deleting the implementation")]
-    public static async Task<string> OverwriteMember(
+    [Description("🔍 .NET専用 - .cs/.csprojファイルのみ対応。[DESTRUCTIVE] 既存メンバーを完全に置換")]
+    public static async Task<object> OverwriteMember(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
         ICodeAnalysisService codeAnalysisService,
         ILogger<ModificationToolsLogCategory> logger,
-        [Description("Path to the file containing the member to rewrite.")] string filePath,
-        [Description("FQN of the member to rewrite.")] string fullyQualifiedMemberName,
-        [Description("The new C# code for the member. Include attributes and XML documentation if present. To delete, use `// Delete {memberName}`.")] string newMemberCode,
+        [Description("C#ファイル(.cs)の絶対パス")] string filePath,
+        [Description("Member name or FQN to replace")] string memberNameOrFqn,
+        [Description("New C# code for the member (include attributes and XML docs if present)")] string newMemberCode,
+        [Description("危険な操作の実行確認（正確に \"Yes\" と入力）")] string? userConfirmResponse = null,
         CancellationToken cancellationToken = default) {
-        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync<object, ModificationToolsLogCategory>(async () => {
+            // 🔍 .NET関連ファイル検証（最優先実行）
+            CSharpFileValidationHelper.ValidateDotNetFileForRoslyn(filePath, nameof(OverwriteMember), logger);
+            
             ErrorHandlingHelpers.ValidateStringParameter(filePath, "filePath", logger);
-            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedMemberName, "fullyQualifiedMemberName", logger);
+            ErrorHandlingHelpers.ValidateStringParameter(memberNameOrFqn, "memberNameOrFqn", logger);
             ErrorHandlingHelpers.ValidateStringParameter(newMemberCode, "newMemberCode", logger);
             newMemberCode = newMemberCode.TrimBackslash();
 
@@ -877,7 +953,7 @@ public static class ModificationTools {
             }
 
             logger.LogInformation("Executing '{OverwriteMember}' for: {MemberName} in {FilePath}",
-                nameof(OverwriteMember), fullyQualifiedMemberName, filePath);
+                nameof(OverwriteMember), memberNameOrFqn, filePath);
 
             // Create a workspace for the file
             var (workspace, project, document) = await workspaceFactory.CreateForFileAsync(filePath);
@@ -891,6 +967,12 @@ public static class ModificationTools {
                 if (compilation == null) {
                     throw new McpException("Failed to get compilation");
                 }
+
+                // Capture before operation diagnostics
+                var beforeDiagnostics = await DiagnosticHelper.CaptureDiagnosticsAsync(
+                    compilation, 
+                    "操作前から存在していた診断", 
+                    cancellationToken);
 
                 // Find the symbol
                 ISymbol? symbol = null;
@@ -909,14 +991,14 @@ public static class ModificationTools {
                         if (node is FieldDeclarationSyntax fieldDecl) {
                             foreach (var variable in fieldDecl.Declaration.Variables) {
                                 var fieldSymbol = semanticModel.GetDeclaredSymbol(variable);
-                                if (fieldSymbol != null && IsSymbolMatch(fieldSymbol, fullyQualifiedMemberName)) {
+                                if (fieldSymbol != null && IsSymbolMatch(fieldSymbol, memberNameOrFqn)) {
                                     symbol = fieldSymbol;
                                     break;
                                 }
                             }
                         } else {
                             var declaredSymbol = semanticModel.GetDeclaredSymbol(node);
-                            if (declaredSymbol != null && IsSymbolMatch(declaredSymbol, fullyQualifiedMemberName)) {
+                            if (declaredSymbol != null && IsSymbolMatch(declaredSymbol, memberNameOrFqn)) {
                                 symbol = declaredSymbol;
                                 break;
                             }
@@ -929,22 +1011,48 @@ public static class ModificationTools {
                 }
 
                 if (symbol == null) {
-                    throw new McpException($"Symbol '{fullyQualifiedMemberName}' not found");
+                    throw new McpException($"Symbol '{memberNameOrFqn}' not found");
                 }
 
                 if (!symbol.DeclaringSyntaxReferences.Any()) {
-                    throw new McpException($"Symbol '{fullyQualifiedMemberName}' has no declaring syntax references.");
+                    throw new McpException($"Symbol '{memberNameOrFqn}' has no declaring syntax references.");
                 }
 
                 var syntaxRef = symbol.DeclaringSyntaxReferences.FirstOrDefault(sr => sr.SyntaxTree.FilePath == filePath);
                 if (syntaxRef == null) {
-                    throw new McpException($"Symbol '{fullyQualifiedMemberName}' is not declared in file {filePath}");
+                    throw new McpException($"Symbol '{memberNameOrFqn}' is not declared in file {filePath}");
                 }
 
                 var oldNode = await syntaxRef.GetSyntaxAsync(cancellationToken);
 
                 if (oldNode is not MemberDeclarationSyntax && oldNode is not TypeDeclarationSyntax) {
-                    throw new McpException($"Symbol '{fullyQualifiedMemberName}' does not represent a replaceable member or type.");
+                    throw new McpException($"Symbol '{memberNameOrFqn}' does not represent a replaceable member or type.");
+                }
+
+                // Check for dangerous operation before proceeding
+                if (userConfirmResponse?.Trim().Equals("Yes", StringComparison.Ordinal) != true) {
+                    var dangerousResult = DangerousOperationDetector.CreateDangerousOperationResult(
+                        null, // No pattern for OverwriteMember
+                        1,    // Single member overwrite
+                        1,    // Single file affected
+                        isDestructive: true);
+
+                    // For OverwriteMember, always require confirmation since it's irreversible
+                    dangerousResult.DangerousOperationDetected = true;
+                    dangerousResult.RiskLevel = RiskLevels.High;
+                    dangerousResult.RiskType = RiskTypes.DestructiveOperation;
+                    dangerousResult.Message = $"🚨 破壊的操作: '{memberNameOrFqn}' を完全に置き換えます。元のコードは失われます。";
+                    dangerousResult.Recommendation = "元のコードをGetMethodSignatureで確認してから操作を実行してください";
+                    dangerousResult.RequiredConfirmationText = "Yes";
+                    dangerousResult.ConfirmationPrompt = "この操作を実行するには、userConfirmResponse パラメータに正確に \"Yes\" と入力してください";
+                    dangerousResult.Details = new DangerousOperationDetails {
+                        Pattern = null,
+                        EstimatedReplacements = 1,
+                        AffectedFiles = 1,
+                        RiskFactors = new List<string> { RiskTypes.DestructiveOperation }
+                    };
+                    
+                    return dangerousResult;
                 }
 
                 bool isDelete = newMemberCode.StartsWith("// Delete", StringComparison.OrdinalIgnoreCase);
@@ -978,9 +1086,32 @@ public static class ModificationTools {
                             ? string.Join("\n", diagnostics.Select(d => $"- {d.GetMessage()}"))
                             : "<errorCheck>No compilation issues detected.</errorCheck>";
 
-                        return $"✅ シンボルを正常に削除しました {fullyQualifiedMemberName}.\n\n{errorMessages}";
                     }
-                    return $"✅ シンボルを正常に削除しました {fullyQualifiedMemberName}";
+                    
+                    var deleteResult = new OverwriteMemberResult
+                    {
+                        Success = true,
+                        Message = $"シンボルを正常に削除しました: {memberNameOrFqn}",
+                        MemberName = memberNameOrFqn,
+                        MemberType = "削除済み",
+                        TargetClass = symbol?.ContainingType?.Name ?? symbol?.Name ?? "不明",
+                        FilePath = filePath
+                    };
+                    
+                    if (updatedDocument != null) {
+                        var updatedCompilation = await updatedDocument.Project.GetCompilationAsync(cancellationToken);
+                        
+                        // Add detailed compilation status
+                        if (updatedCompilation != null) {
+                            deleteResult.CompilationStatus = await DiagnosticHelper.CreateDetailedStatusAsync(
+                                compilation,
+                                updatedCompilation,
+                                cancellationToken);
+                        }
+                    }
+                    
+                    deleteResult.Notes.Add("メンバーが削除されました");
+                    return deleteResult;
                 }
 
                 SyntaxNode? newNode;
@@ -1167,7 +1298,6 @@ public static class ModificationTools {
                                                $"Provided code:\n```csharp\n{newMethodText}\n```\n\n" +
                                                $"This would DELETE the method body! If you want to:\n" +
                                                $"   - Update the complete method: Include the entire method with its body\n" +
-                                               $"   - Update just the signature: Use UpdateToolDescription for descriptions\n" +
                                                $"   - Delete the method: Use '// Delete {oldMethod.Identifier.Text}'\n" +
                                                $"   - View current implementation: Use {ToolHelpers.SharpToolPrefix}GetMethodSignature\n\n" +
                                                $"💡 Safety tip: Always provide the complete method implementation when using OverwriteMember";
@@ -1223,10 +1353,41 @@ public static class ModificationTools {
                         ? $"<errorCheck>Compilation errors detected:\n{string.Join("\n", diagnostics.Select(d => $"- {d.GetMessage()}"))}</errorCheck>"
                         : "<errorCheck>No compilation issues detected.</errorCheck>";
 
-                    return $"✅ シンボルを正常に置換しました {fullyQualifiedMemberName}.\n\n{diffResult}\n\n{errorMessages}";
                 }
-
-                return $"✅ シンボルを正常に置換しました {fullyQualifiedMemberName}.\n\n{diffResult}";
+                
+                var result = new OverwriteMemberResult
+                {
+                    Success = true,
+                    Message = $"シンボルを正常に置換しました: {memberNameOrFqn}",
+                    MemberName = memberNameOrFqn,
+                    MemberType = GetMemberTypeName(newNode),
+                    TargetClass = symbol?.ContainingType?.Name ?? symbol?.Name ?? "不明",
+                    FilePath = filePath
+                };
+                
+                if (finalDocument != null) {
+                    var finalCompilation = await finalDocument.Project.GetCompilationAsync(cancellationToken);
+                    
+                    // Add detailed compilation status
+                    if (finalCompilation != null) {
+                        result.CompilationStatus = await DiagnosticHelper.CreateDetailedStatusAsync(
+                            compilation,
+                            finalCompilation,
+                            cancellationToken);
+                    }
+                }
+                
+                // Add notes about the operation
+                if (oldNode is MemberDeclarationSyntax oldMember && newNode is MemberDeclarationSyntax newMember) {
+                    var oldModifiers = oldMember.Modifiers.Select(m => m.Text).ToList();
+                    var newModifiers = newMember.Modifiers.Select(m => m.Text).ToList();
+                    
+                    if (!oldModifiers.SequenceEqual(newModifiers)) {
+                        result.Notes.Add($"修飾子が変更されました: {string.Join(" ", oldModifiers)} → {string.Join(" ", newModifiers)}");
+                    }
+                }
+                
+                return result;
 
             } finally {
                 workspace.Dispose();
@@ -1235,17 +1396,20 @@ public static class ModificationTools {
     }
 
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(UpdateParameterDescription), Idempotent = false, Destructive = false, OpenWorld = false, ReadOnly = false)]
-    [Description("🎯 Safely update only the Description attribute of a method parameter without changing the method signature")]
+    [Description("🔍 .NET専用 - .cs/.csprojファイルのみ対応。メソッドパラメータのDescription属性を更新")]
     public static async Task<string> UpdateParameterDescription(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
         ILogger<ModificationToolsLogCategory> logger,
-        [Description("Path to the C# file containing the method")] string filePath,
-        [Description("The method name containing the parameter")] string methodName,
-        [Description("The parameter name to update")] string parameterName,
-        [Description("The new description text (without [Description(...)] wrapper) - TESTED VERSION")] string newDescription,
+        [Description("C#ファイル(.cs)の絶対パス")] string filePath,
+        [Description("Method name containing the parameter")] string methodName,
+        [Description("Parameter name to update")] string parameterName,
+        [Description("New description text (without [Description(...)] wrapper)")] string newDescription,
         CancellationToken cancellationToken = default) {
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            // 🔍 .NET関連ファイル検証（最優先実行）
+            CSharpFileValidationHelper.ValidateDotNetFileForRoslyn(filePath, nameof(UpdateParameterDescription), logger);
+            
             ErrorHandlingHelpers.ValidateStringParameter(filePath, nameof(filePath), logger);
             ErrorHandlingHelpers.ValidateStringParameter(methodName, nameof(methodName), logger);
             ErrorHandlingHelpers.ValidateStringParameter(parameterName, nameof(parameterName), logger);
@@ -1378,17 +1542,20 @@ public static class ModificationTools {
     }
 
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(RenameSymbol), Idempotent = true, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("Renames a symbol and updates all references in a file. Works without a pre-loaded solution.")]
-    public static async Task<string> RenameSymbol(
+    [Description("🔍 .NET専用 - .cs/.csprojファイルのみ対応。シンボルの名前を変更し、すべての参照を更新")]
+    public static async Task<object> RenameSymbol(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
         ICodeAnalysisService codeAnalysisService,
         ILogger<ModificationToolsLogCategory> logger,
-        [Description("Path to the file containing the symbol to rename.")] string filePath,
+        [Description("C#ファイル(.cs)の絶対パス")] string filePath,
         [Description("The old name of the symbol.")] string oldName,
         [Description("The new name for the symbol.")] string newName,
         CancellationToken cancellationToken = default) {
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            // 🔍 .NET関連ファイル検証（最優先実行）
+            CSharpFileValidationHelper.ValidateDotNetFileForRoslyn(filePath, nameof(RenameSymbol), logger);
+            
             // Validate parameters
             ErrorHandlingHelpers.ValidateStringParameter(filePath, "filePath", logger);
             ErrorHandlingHelpers.ValidateStringParameter(oldName, "oldName", logger);
@@ -1413,6 +1580,15 @@ public static class ModificationTools {
                 if (document == null) {
                     throw new McpException($"File {filePath} not found in the project");
                 }
+
+                // Capture before operation diagnostics
+                var beforeCompilation = await project.GetCompilationAsync(cancellationToken);
+                var beforeDiagnostics = beforeCompilation != null 
+                    ? await DiagnosticHelper.CaptureDiagnosticsAsync(
+                        beforeCompilation, 
+                        "操作前から存在していた診断", 
+                        cancellationToken)
+                    : null;
 
                 var root = await document.GetSyntaxRootAsync(cancellationToken);
                 if (root == null) {
@@ -1462,23 +1638,61 @@ public static class ModificationTools {
                     throw new McpException("Failed to apply rename changes to the workspace");
                 }
 
+                // Get changed files
+                var changedFiles = new List<string>();
+                foreach (var projectChange in changeset.GetProjectChanges()) {
+                    foreach (var docId in projectChange.GetChangedDocuments()) {
+                        var doc = newSolution.GetDocument(docId);
+                        if (doc?.FilePath != null) {
+                            changedFiles.Add(doc.FilePath);
+                        }
+                    }
+                }
+
+                // Determine symbol type
+                string symbolType = symbolToRename.Kind.ToString();
+                if (symbolToRename is IMethodSymbol) symbolType = "Method";
+                else if (symbolToRename is IPropertySymbol) symbolType = "Property";
+                else if (symbolToRename is IFieldSymbol) symbolType = "Field";
+                else if (symbolToRename is INamedTypeSymbol) symbolType = "Type";
+                else if (symbolToRename is INamespaceSymbol) symbolType = "Namespace";
+                else if (symbolToRename is IParameterSymbol) symbolType = "Parameter";
+                else if (symbolToRename is ILocalSymbol) symbolType = "Local";
+
+                // Count total references (approximate)
+                var totalReferences = nodes.Count();
+
+                // Create structured result
+                var result = new RenameSymbolResult {
+                    Success = true,
+                    Message = $"シンボル '{oldName}' を '{newName}' に正常にリネームしました",
+                    OldName = oldName,
+                    NewName = newName,
+                    SymbolType = symbolType,
+                    ChangedFileCount = changedDocumentCount,
+                    ChangedFiles = changedFiles,
+                    TotalReferences = totalReferences,
+                    FilePath = filePath
+                };
+
                 // Check for compilation errors
                 var updatedDocument = workspace.CurrentSolution.GetDocument(document.Id);
                 if (updatedDocument != null) {
-                    var compilation = await updatedDocument.Project.GetCompilationAsync(cancellationToken);
-                    var diagnostics = compilation?.GetDiagnostics(cancellationToken)
-                        .Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error)
-                        .Take(10)
+                    var finalCompilation = await updatedDocument.Project.GetCompilationAsync(cancellationToken);
+                    var diagnostics = finalCompilation?.GetDiagnostics(cancellationToken)
+                        .Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error || d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Warning)
                         .ToList() ?? new List<Diagnostic>();
 
-                    string errorMessages = diagnostics.Any()
-                        ? $"<errorCheck>Compilation errors detected:\n{string.Join("\n", diagnostics.Select(d => $"- {d.GetMessage()}"))}</errorCheck>"
-                        : "<errorCheck>No compilation issues detected.</errorCheck>";
-
-                    return $"Symbol '{oldName}' successfully renamed to '{newName}' in {changedDocumentCount} document(s).\n\n{errorMessages}";
+                    // Add detailed compilation status
+                    if (beforeCompilation != null && finalCompilation != null) {
+                        result.CompilationStatus = await DiagnosticHelper.CreateDetailedStatusAsync(
+                            beforeCompilation,
+                            finalCompilation,
+                            cancellationToken);
+                    }
                 }
 
-                return $"Symbol '{oldName}' successfully renamed to '{newName}' in {changedDocumentCount} document(s).";
+                return result;
 
             } finally {
                 workspace.Dispose();
@@ -1486,18 +1700,21 @@ public static class ModificationTools {
         }, logger, nameof(RenameSymbol), cancellationToken);
     }
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(FindAndReplace), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("Performs regex-based find and replace in a single file. Works without a pre-loaded solution.")]
-    public static async Task<string> FindAndReplace(
+    [Description("🔍 .NET専用 - .cs/.csprojファイルのみ対応。正規表現による検索置換を実行")]
+    public static async Task<object> FindAndReplace(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
         IDocumentOperationsService documentOperations,
         ILogger<ModificationToolsLogCategory> logger,
-        [Description("Path to the file to perform find and replace in.")] string filePath,
+        [Description("C#ファイル(.cs)の絶対パス")] string filePath,
         [Description("Regex pattern in multiline mode. Use `\\s*` for unknown indentation. Remember to escape for JSON.")] string regexPattern,
         [Description("Replacement text, which can include regex groups ($1, ${name}, etc.)")] string replacementText,
         CancellationToken cancellationToken = default) {
 
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            // 🔍 .NET関連ファイル検証（最優先実行）
+            CSharpFileValidationHelper.ValidateDotNetFileForRoslyn(filePath, nameof(FindAndReplace), logger);
+            
             // Validate parameters
             ErrorHandlingHelpers.ValidateStringParameter(filePath, "filePath", logger);
             ErrorHandlingHelpers.ValidateStringParameter(regexPattern, "regexPattern", logger);
@@ -1548,7 +1765,15 @@ public static class ModificationTools {
                     await statelessDocOps.WriteFileAsync(filePath, newContent, true, cancellationToken);
                     var diff = ContextInjectors.CreateCodeDiff(originalContent, newContent);
                     var matchCount = regex.Matches(originalContent).Count;
-                    return $"✅ {matchCount}件の置換を実行しました in non-code file {filePath}.\n\n{diff}";
+                    
+                    return new FindAndReplaceResult {
+                        Success = true,
+                        Message = $"{matchCount}件の置換を正常に実行しました (非コードファイル)",
+                        ReplacementCount = matchCount,
+                        AffectedMembers = new List<string>(), // Non-code files don't have members
+                        Diff = diff,
+                        FilePath = filePath
+                    };
                 } else {
                     // Check if pattern exists in file
                     var matchCount = regex.Matches(originalContent).Count;
@@ -1573,6 +1798,15 @@ public static class ModificationTools {
                 if (document == null) {
                     throw new McpException($"File {filePath} not found in the project");
                 }
+
+                // Capture before operation diagnostics
+                var beforeCompilation = await project.GetCompilationAsync(cancellationToken);
+                var beforeDiagnostics = beforeCompilation != null 
+                    ? await DiagnosticHelper.CaptureDiagnosticsAsync(
+                        beforeCompilation, 
+                        "操作前から存在していた診断", 
+                        cancellationToken)
+                    : null;
 
                 // Get the original text for comparison
                 var originalText = await document.GetTextAsync(cancellationToken);
@@ -1618,28 +1852,66 @@ public static class ModificationTools {
                     var newTextContent = await newDoc.GetTextAsync(cancellationToken);
                     var diff = ContextInjectors.CreateCodeDiff(originalTextContent.ToString(), newTextContent.ToString());
 
+                    var matchCount = regex.Matches(originalTextContent.ToString()).Count;
+
+                    // Get affected members
+                    var affectedMembers = new List<string>();
+                    var syntaxRoot = await newDoc.GetSyntaxRootAsync(cancellationToken);
+                    if (syntaxRoot != null) {
+                        // Find members that contain replacements
+                        var modifiedPositions = new List<int>();
+                        var match = regex.Match(originalTextContent.ToString());
+                        while (match.Success) {
+                            modifiedPositions.Add(match.Index);
+                            match = match.NextMatch();
+                        }
+
+                        foreach (var pos in modifiedPositions) {
+                            var token = syntaxRoot.FindToken(pos);
+                            var memberNode = token.Parent?.AncestorsAndSelf()
+                                .FirstOrDefault(n => n is MemberDeclarationSyntax);
+                            if (memberNode is MemberDeclarationSyntax member) {
+                                var memberName = GetMemberName(member);
+                                if (!affectedMembers.Contains(memberName)) {
+                                    affectedMembers.Add(memberName);
+                                }
+                            }
+                        }
+                    }
+
+                    // Create structured result
+                    var result = new FindAndReplaceResult {
+                        Success = true,
+                        Message = $"{matchCount}件の置換を正常に実行しました",
+                        ReplacementCount = matchCount,
+                        AffectedMembers = affectedMembers,
+                        Diff = diff,
+                        FilePath = filePath
+                    };
+
                     // Check for compilation errors
                     var compilation = await newDoc.Project.GetCompilationAsync(cancellationToken);
                     var diagnostics = compilation?.GetDiagnostics(cancellationToken)
-                        .Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error)
-                        .Take(10)
+                        .Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error || d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Warning)
                         .ToList() ?? new List<Diagnostic>();
 
-                    string errorMessages = diagnostics.Any()
-                        ? $"<errorCheck>Compilation errors detected:\n{string.Join("\n", diagnostics.Select(d => $"- {d.GetMessage()}"))}</errorCheck>"
-                        : "<errorCheck>No compilation issues detected.</errorCheck>";
+                    // Add detailed compilation status
+                    if (beforeCompilation != null && compilation != null) {
+                        result.CompilationStatus = await DiagnosticHelper.CreateDetailedStatusAsync(
+                            beforeCompilation,
+                            compilation,
+                            cancellationToken);
+                    }
 
-                    var matchCount = regex.Matches(originalTextContent.ToString()).Count;
-                    return $"✅ {matchCount}件の置換を実行しました\n" +
-                           $"📁 ファイル: {filePath}\n" +
-                           $"🔍 パターン: '{regexPattern}'\n" +
-                           $"📝 置換テキスト: '{replacementText}'\n\n{errorMessages}\n\n{diff}";
+                    return result;
                 }
 
-                return $"✅ 置換を実行しました\n" +
-                       $"📁 ファイル: {filePath}\n" +
-                       $"🔍 パターン: '{regexPattern}'\n" +
-                       $"📝 置換テキスト: '{replacementText}'";
+                return new FindAndReplaceResult {
+                    Success = true,
+                    Message = "置換を実行しました",
+                    ReplacementCount = 0,
+                    FilePath = filePath
+                };
 
             } finally {
                 workspace.Dispose();
@@ -1648,21 +1920,24 @@ public static class ModificationTools {
     }
 
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(MoveMember), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
-    [Description("Moves a member (property, field, method, nested type, etc.) from one type/namespace to another. Requires the solution path since member moves need full solution context.")]
-    public static async Task<string> MoveMember(
+    [Description("🔍 .NET専用 - .sln/.csprojファイルのみ対応。メンバーを別の型/名前空間に移動")]
+    public static async Task<object> MoveMember(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeModificationService modificationService,
         IFuzzyFqnLookupService fuzzyLookup,
         ILogger<ModificationToolsLogCategory> logger,
-        [Description("Path to the solution (.sln) file containing both the source member and destination type.")] string solutionPath,
-        [Description("FQN of the member to move.")] string fullyQualifiedMemberName,
-        [Description("FQN of the destination type or namespace where the member should be moved.")] string fullyQualifiedDestinationTypeOrNamespaceName,
+        [Description(".NETソリューション(.sln)ファイルのパス")] string solutionPath,
+        [Description("FQN of the member to move")] string memberNameOrFqn,
+        [Description("FQN of the destination type or namespace")] string destinationTypeOrNamespace,
         CancellationToken cancellationToken = default) {
 
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+            // 🔍 .NET関連ファイル検証（最優先実行）
+            CSharpFileValidationHelper.ValidateDotNetFileForRoslyn(solutionPath, nameof(MoveMember), logger);
+            
             ErrorHandlingHelpers.ValidateStringParameter(solutionPath, nameof(solutionPath), logger);
-            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedMemberName, nameof(fullyQualifiedMemberName), logger);
-            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedDestinationTypeOrNamespaceName, nameof(fullyQualifiedDestinationTypeOrNamespaceName), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(memberNameOrFqn, nameof(memberNameOrFqn), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(destinationTypeOrNamespace, nameof(destinationTypeOrNamespace), logger);
 
             // Validate solution file exists and has correct extension
             if (!File.Exists(solutionPath)) {
@@ -1673,7 +1948,7 @@ public static class ModificationTools {
             }
 
             logger.LogInformation("Executing '{MoveMember}' moving {MemberName} to {DestinationName} in solution {SolutionPath}",
-                nameof(MoveMember), fullyQualifiedMemberName, fullyQualifiedDestinationTypeOrNamespaceName, solutionPath);
+                nameof(MoveMember), memberNameOrFqn, destinationTypeOrNamespace, solutionPath);
 
             var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(solutionPath);
 
@@ -1688,45 +1963,54 @@ public static class ModificationTools {
                     solution = ((Project)dynamicContext.Project).Solution;
                 }
 
+                // Capture before operation diagnostics
+                var beforeCompilation = await solution.Projects.FirstOrDefault()?.GetCompilationAsync(cancellationToken);
+                var beforeDiagnostics = beforeCompilation != null 
+                    ? await DiagnosticHelper.CaptureDiagnosticsAsync(
+                        beforeCompilation, 
+                        "操作前から存在していた診断", 
+                        cancellationToken)
+                    : null;
+
                 // Find the source member symbol using fuzzy lookup
                 var tempSolutionManager = new StatelessSolutionManager(solution);
-                var sourceMemberMatches = await fuzzyLookup.FindMatchesAsync(fullyQualifiedMemberName, tempSolutionManager, cancellationToken);
+                var sourceMemberMatches = await fuzzyLookup.FindMatchesAsync(memberNameOrFqn, tempSolutionManager, cancellationToken);
                 var sourceMemberMatch = sourceMemberMatches.FirstOrDefault();
                 if (sourceMemberMatch == null) {
-                    throw new McpException($"No symbol found matching '{fullyQualifiedMemberName}'.");
+                    throw new McpException($"No symbol found matching '{memberNameOrFqn}'.");
                 }
 
                 var sourceMemberSymbol = sourceMemberMatch.Symbol;
                 if (sourceMemberSymbol == null) {
-                    throw new McpException($"Could not find symbol '{fullyQualifiedMemberName}' in the workspace.");
+                    throw new McpException($"Could not find symbol '{memberNameOrFqn}' in the workspace.");
                 }
 
                 if (sourceMemberSymbol is not (IFieldSymbol or IPropertySymbol or IMethodSymbol or IEventSymbol or INamedTypeSymbol { TypeKind: TypeKind.Class or TypeKind.Struct or TypeKind.Interface or TypeKind.Enum or TypeKind.Delegate })) {
-                    throw new McpException($"Symbol '{fullyQualifiedMemberName}' is not a movable member type. Only fields, properties, methods, events, and nested types can be moved.");
+                    throw new McpException($"Symbol '{memberNameOrFqn}' is not a movable member type. Only fields, properties, methods, events, and nested types can be moved.");
                 }
 
                 // Find the destination symbol
-                var destinationMatches = await fuzzyLookup.FindMatchesAsync(fullyQualifiedDestinationTypeOrNamespaceName, tempSolutionManager, cancellationToken);
+                var destinationMatches = await fuzzyLookup.FindMatchesAsync(destinationTypeOrNamespace, tempSolutionManager, cancellationToken);
                 var destinationMatch = destinationMatches.FirstOrDefault();
                 if (destinationMatch == null) {
-                    throw new McpException($"No symbol found matching '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
+                    throw new McpException($"No symbol found matching '{destinationTypeOrNamespace}'.");
                 }
 
                 var destinationSymbol = destinationMatch.Symbol;
 
                 if (destinationSymbol is not (INamedTypeSymbol or INamespaceSymbol)) {
-                    throw new McpException($"Destination '{fullyQualifiedDestinationTypeOrNamespaceName}' must be a type or namespace.");
+                    throw new McpException($"Destination '{destinationTypeOrNamespace}' must be a type or namespace.");
                 }
 
                 // Get syntax references
                 var sourceSyntaxRef = sourceMemberSymbol.DeclaringSyntaxReferences.FirstOrDefault();
                 if (sourceSyntaxRef == null) {
-                    throw new McpException($"Could not find syntax reference for member '{fullyQualifiedMemberName}'.");
+                    throw new McpException($"Could not find syntax reference for member '{memberNameOrFqn}'.");
                 }
 
                 var sourceMemberNode = await sourceSyntaxRef.GetSyntaxAsync(cancellationToken);
                 if (sourceMemberNode is not MemberDeclarationSyntax memberDeclaration) {
-                    throw new McpException($"Source member '{fullyQualifiedMemberName}' is not a valid member declaration.");
+                    throw new McpException($"Source member '{memberNameOrFqn}' is not a valid member declaration.");
                 }
 
                 Document currentSourceDocument = ToolHelpers.GetDocumentFromSyntaxNodeOrThrow(solution, sourceMemberNode);
@@ -1738,7 +2022,7 @@ public static class ModificationTools {
                     destinationTypeSymbol = typeSym;
                     var destSyntaxRef = typeSym.DeclaringSyntaxReferences.FirstOrDefault();
                     if (destSyntaxRef == null) {
-                        throw new McpException($"Could not find syntax reference for destination type '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
+                        throw new McpException($"Could not find syntax reference for destination type '{destinationTypeOrNamespace}'.");
                     }
                     var destNode = await destSyntaxRef.GetSyntaxAsync(cancellationToken);
                     destinationDocument = ToolHelpers.GetDocumentFromSyntaxNodeOrThrow(solution, destNode);
@@ -1758,7 +2042,7 @@ public static class ModificationTools {
                 }
 
                 if (currentSourceDocument.Id == destinationDocument.Id && sourceMemberSymbol.ContainingSymbol.Equals(destinationSymbol, SymbolEqualityComparer.Default)) {
-                    throw new McpException($"Source and destination are the same. Member '{fullyQualifiedMemberName}' is already in '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
+                    throw new McpException($"Source and destination are the same. Member '{memberNameOrFqn}' is already in '{destinationTypeOrNamespace}'.");
                 }
 
                 string memberName = GetMemberName(memberDeclaration);
@@ -1776,7 +2060,7 @@ public static class ModificationTools {
                 }
 
                 if (updatedDestinationTypeSymbol != null && !IsMemberAllowed(updatedDestinationTypeSymbol, memberDeclaration, memberName, cancellationToken)) {
-                    throw new McpException($"A member with the name '{memberName}' already exists in destination type '{fullyQualifiedDestinationTypeOrNamespaceName}'.");
+                    throw new McpException($"A member with the name '{memberName}' already exists in destination type '{destinationTypeOrNamespace}'.");
                 }
 
                 try {
@@ -1860,19 +2144,273 @@ public static class ModificationTools {
                         ? $"within {sourceFilePathDisplay}"
                         : $"from {sourceFilePathDisplay} to {destinationFilePathDisplay}";
 
-                    var errorInfo = errorBuilder.Length > 0 ? $"\n\nCompilation status:\n{errorBuilder}" : "";
+                    // Create structured result
+                    var result = new MoveMemberResult {
+                        Success = true,
+                        Message = $"メンバー '{memberName}' を '{destinationTypeOrNamespace}' に正常に移動しました",
+                        MemberName = memberName,
+                        SourceClass = sourceMemberSymbol.ContainingType?.Name ?? "不明",
+                        TargetClass = destinationTypeOrNamespace,
+                        TargetFile = destinationFilePathDisplay,
+                        FilePath = sourceFilePathDisplay
+                    };
 
-                    return $"Successfully moved member '{memberName}' to '{fullyQualifiedDestinationTypeOrNamespaceName}' {locationInfo}.{errorInfo}";
+                    // Add notes
+                    if (sourceFilePathDisplay == destinationFilePathDisplay) {
+                        result.Notes.Add($"同一ファイル内で移動しました: {sourceFilePathDisplay}");
+                    } else {
+                        result.Notes.Add($"異なるファイル間で移動しました");
+                        result.Notes.Add($"移動元: {sourceFilePathDisplay}");
+                        result.Notes.Add($"移動先: {destinationFilePathDisplay}");
+                    }
+
+                    // Check compilation status
+                    if (finalSourceDocument != null || finalDestinationDocument != null) {
+                        var finalProject = finalSourceDocument?.Project ?? finalDestinationDocument?.Project;
+                        if (finalProject != null) {
+                            var finalCompilation = await finalProject.GetCompilationAsync(cancellationToken);
+                            var diagnostics = finalCompilation?.GetDiagnostics(cancellationToken)
+                                .Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error || d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Warning)
+                                .ToList() ?? new List<Diagnostic>();
+
+                            // Add detailed compilation status
+                            if (beforeCompilation != null && finalCompilation != null) {
+                                result.CompilationStatus = await DiagnosticHelper.CreateDetailedStatusAsync(
+                                    beforeCompilation,
+                                    finalCompilation,
+                                    cancellationToken);
+                            }
+                        }
+                    }
+
+                    return result;
 
                 } catch (Exception ex) when (!(ex is McpException || ex is OperationCanceledException)) {
-                    logger.LogError(ex, "Failed to move member {MemberName} to {DestinationName}", fullyQualifiedMemberName, fullyQualifiedDestinationTypeOrNamespaceName);
-                    throw new McpException($"Failed to move member '{fullyQualifiedMemberName}' to '{fullyQualifiedDestinationTypeOrNamespaceName}': {ex.Message}", ex);
+                    logger.LogError(ex, "Failed to move member {MemberName} to {DestinationName}", memberNameOrFqn, destinationTypeOrNamespace);
+                    throw new McpException($"Failed to move member '{memberNameOrFqn}' to '{destinationTypeOrNamespace}': {ex.Message}", ex);
                 }
 
             } finally {
                 workspace.Dispose();
             }
         }, logger, nameof(MoveMember), cancellationToken);
+    }
+
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(ReplaceAcrossFiles), Idempotent = false, Destructive = true, OpenWorld = false, ReadOnly = false)]
+    [Description("🔍 .NET専用 - .sln/.csprojファイルのみ対応。[DESTRUCTIVE] プロジェクト全体で正規表現による検索・置換を実行")]
+    public static async Task<object> ReplaceAcrossFiles(
+        StatelessWorkspaceFactory workspaceFactory,
+        ILogger<ModificationToolsLogCategory> logger,
+        [Description(".NETソリューション(.sln)またはプロジェクト(.csproj)ファイルのパス")] string solutionOrProjectPath,
+        [Description("検索する正規表現パターン")] string regexPattern,
+        [Description("置換文字列（正規表現グループ参照可能: $1, $2など）")] string replacementText,
+        [Description("対象ファイルの拡張子フィルター（デフォルト: .cs）")] string fileExtensions = ".cs",
+        [Description("実際に変更せずプレビューのみ（デフォルト: false）")] bool dryRun = false,
+        [Description("大文字小文字を区別するか（デフォルト: false）")] bool caseSensitive = false,
+        [Description("最大処理ファイル数（デフォルト: 1000）")] int maxFiles = 1000,
+        [Description("危険な操作の実行確認（正確に \"Yes\" と入力）")] string? userConfirmResponse = null,
+        CancellationToken cancellationToken = default) {
+        
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync<object, ModificationToolsLogCategory>(async () => {
+            // 🔍 .NET関連ファイル検証（最優先実行）
+            CSharpFileValidationHelper.ValidateDotNetFileForRoslyn(solutionOrProjectPath, nameof(ReplaceAcrossFiles), logger);
+            
+            ErrorHandlingHelpers.ValidateStringParameter(solutionOrProjectPath, nameof(solutionOrProjectPath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(regexPattern, nameof(regexPattern), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(replacementText, nameof(replacementText), logger);
+
+            logger.LogInformation("Executing '{ReplaceAcrossFiles}' with pattern: {Pattern} in {FilePath}",
+                nameof(ReplaceAcrossFiles), regexPattern, solutionOrProjectPath);
+
+            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(solutionOrProjectPath);
+
+            try {
+                Solution solution;
+                if (context is Solution sol) {
+                    solution = sol;
+                } else if (context is Project proj) {
+                    solution = proj.Solution;
+                } else {
+                    // For other contexts (e.g., Document), get the solution through the project
+                    var dynamicContext = (dynamic)context;
+                    solution = ((Project)dynamicContext.Project).Solution;
+                }
+
+                if (solution.Projects.Count() == 0) {
+                    throw new McpException($"プロジェクトが見つかりません: {solutionOrProjectPath}");
+                }
+
+                // Parse file extensions
+                var allowedExtensions = fileExtensions.Split(',')
+                    .Select(ext => ext.Trim().StartsWith(".") ? ext.Trim() : "." + ext.Trim())
+                    .ToHashSet();
+
+                // Collect target documents
+                var targetDocuments = solution.Projects
+                    .SelectMany(p => p.Documents)
+                    .Where(d => d.FilePath != null && 
+                                allowedExtensions.Contains(Path.GetExtension(d.FilePath)))
+                    .Take(maxFiles)
+                    .ToList();
+
+                if (targetDocuments.Count == 0) {
+                    return new {
+                        pattern = regexPattern,
+                        replacement = replacementText,
+                        dryRun = dryRun,
+                        totalFilesProcessed = 0,
+                        totalMatches = 0,
+                        affectedFiles = new List<object>(),
+                        summary = new {
+                            affectedFileCount = 0,
+                            totalReplacements = 0,
+                            errorCount = 0,
+                            filesUpdated = 0
+                        },
+                        message = "対象ファイルが見つかりませんでした"
+                    };
+                }
+
+                // Setup regex
+                var regexOptions = RegexOptions.Multiline;
+                if (!caseSensitive)
+                    regexOptions |= RegexOptions.IgnoreCase;
+
+                Regex regex;
+                try {
+                    regex = new Regex(regexPattern, regexOptions);
+                } catch (ArgumentException ex) {
+                    throw new McpException($"無効な正規表現パターン: {ex.Message}");
+                }
+
+                // Check for dangerous operations before processing
+                if (userConfirmResponse?.Trim().Equals("Yes", StringComparison.Ordinal) != true && !dryRun) {
+                    // Count total matches across all files
+                    int totalMatches = 0;
+                    int filesWithMatches = 0;
+                    
+                    foreach (var document in targetDocuments) {
+                        try {
+                            var sourceText = await document.GetTextAsync(cancellationToken);
+                            var matches = regex.Matches(sourceText.ToString());
+                            if (matches.Count > 0) {
+                                totalMatches += matches.Count;
+                                filesWithMatches++;
+                            }
+                        } catch {
+                            // Ignore errors during counting
+                        }
+                    }
+
+                    // Check if operation is dangerous
+                    var dangerousResult = DangerousOperationDetector.CreateDangerousOperationResult(
+                        regexPattern, 
+                        totalMatches, 
+                        filesWithMatches, 
+                        isDestructive: true);
+
+                    if (dangerousResult.DangerousOperationDetected) {
+                        dangerousResult.RequiredConfirmationText = "Yes";
+                        dangerousResult.ConfirmationPrompt = "この操作を実行するには、userConfirmResponse パラメータに正確に \"Yes\" と入力してください";
+                        return dangerousResult;
+                    }
+                }
+
+                var replacementResults = new List<FileReplacementResult>();
+
+                // Process each file
+                foreach (var document in targetDocuments) {
+                    try {
+                        var sourceText = await document.GetTextAsync(cancellationToken);
+                        var originalContent = sourceText.ToString();
+                        
+                        var matches = regex.Matches(originalContent);
+                        if (matches.Count == 0) continue;
+                        
+                        var newContent = regex.Replace(originalContent, replacementText);
+                        
+                        var result = new FileReplacementResult {
+                            FilePath = document.FilePath ?? "",
+                            MatchCount = matches.Count,
+                            Changes = matches.Cast<Match>().Select(m => new {
+                                line = sourceText.Lines.GetLineFromPosition(m.Index).LineNumber + 1,
+                                originalText = m.Value,
+                                replacedText = regex.Replace(m.Value, replacementText),
+                                startPosition = m.Index,
+                                length = m.Length
+                            }).Cast<object>().ToList()
+                        };
+                        
+                        if (!dryRun && document.FilePath != null) {
+                            // Actually update the file
+                            await File.WriteAllTextAsync(document.FilePath, newContent, Encoding.UTF8, cancellationToken);
+                            result.Updated = true;
+                        }
+                        
+                        replacementResults.Add(result);
+                    } catch (Exception ex) {
+                        // Log error and continue processing
+                        logger.LogError(ex, "Error processing file: {FilePath}", document.FilePath);
+                        replacementResults.Add(new FileReplacementResult { 
+                            FilePath = document.FilePath ?? "",
+                            Error = ex.Message 
+                        });
+                    }
+                }
+
+                // Get compilation status if changes were made
+                CompilationStatusInfo? compilationStatus = null;
+                if (!dryRun && replacementResults.Any(r => r.Updated)) {
+                    try {
+                        // Reload solution to get updated compilation
+                        var (newWorkspace, newContext, newContextType) = await workspaceFactory.CreateForContextAsync(solutionOrProjectPath);
+                        Solution newSolution;
+                        if (newContext is Solution newSol) {
+                            newSolution = newSol;
+                        } else if (newContext is Project newProj) {
+                            newSolution = newProj.Solution;
+                        } else {
+                            var dynamicNewContext = (dynamic)newContext;
+                            newSolution = ((Project)dynamicNewContext.Project).Solution;
+                        }
+                        var compilation = await newSolution.Projects.FirstOrDefault()?.GetCompilationAsync(cancellationToken);
+                        if (compilation != null) {
+                            var diagnostics = await DiagnosticHelper.CaptureDiagnosticsAsync(
+                                compilation, 
+                                "置換後の診断", 
+                                cancellationToken);
+                            compilationStatus = new CompilationStatusInfo {
+                                ErrorCount = diagnostics.ErrorCount,
+                                WarningCount = diagnostics.WarningCount,
+                                Status = diagnostics.ErrorCount > 0 ? "errors" : "clean"
+                            };
+                        }
+                        newWorkspace.Dispose();
+                    } catch (Exception ex) {
+                        logger.LogWarning(ex, "Failed to get compilation status after replacement");
+                    }
+                }
+
+                return new ReplaceAcrossFilesResult {
+                    Pattern = regexPattern,
+                    Replacement = replacementText,
+                    DryRun = dryRun,
+                    TotalFilesProcessed = targetDocuments.Count,
+                    TotalMatches = replacementResults.Sum(r => r.MatchCount),
+                    AffectedFiles = replacementResults.Where(r => r.MatchCount > 0).ToList(),
+                    Summary = new ReplaceAcrossFilesSummary {
+                        AffectedFileCount = replacementResults.Count(r => r.MatchCount > 0),
+                        TotalReplacements = replacementResults.Sum(r => r.MatchCount),
+                        ErrorCount = replacementResults.Count(r => !string.IsNullOrEmpty(r.Error)),
+                        FilesUpdated = dryRun ? 0 : replacementResults.Count(r => r.Updated)
+                    },
+                    CompilationStatus = compilationStatus
+                };
+
+            } finally {
+                workspace.Dispose();
+            }
+        }, logger, nameof(ReplaceAcrossFiles), cancellationToken);
     }
 
     #endregion

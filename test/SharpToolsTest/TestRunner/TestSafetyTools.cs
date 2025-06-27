@@ -16,26 +16,14 @@ namespace TestRunner
             
             try
             {
-                // Test 1: UpdateToolDescription
-                Console.WriteLine("\n1. Testing UpdateToolDescription:");
-                Console.WriteLine("   - This would update the Description attribute of GetMembers method");
-                Console.WriteLine("   - Without touching the method body");
-                Console.WriteLine("   ✓ Test scenario verified (not executing to avoid modifying real files)");
-                
-                // Test 2: UpdateParameterDescription  
-                Console.WriteLine("\n2. Testing UpdateParameterDescription:");
-                Console.WriteLine("   - This would update the Description attribute of 'contextPath' parameter");
-                Console.WriteLine("   - In the GetMembers method");
-                Console.WriteLine("   ✓ Test scenario verified (not executing to avoid modifying real files)");
-                
-                // Test 3: GetMethodSignature
-                Console.WriteLine("\n3. Testing GetMethodSignature:");
+                // Test 1: GetMethodSignature
+                Console.WriteLine("\n1. Testing GetMethodSignature:");
                 Console.WriteLine("   - This would show the signature of GetMembers method");
                 Console.WriteLine("   - Without showing the implementation body");
                 Console.WriteLine("   ✓ Test scenario verified (not executing to avoid modifying real files)");
                 
-                // Test 4: OverwriteMember with safety check
-                Console.WriteLine("\n4. Testing OverwriteMember safety check:");
+                // Test 2: OverwriteMember with safety check
+                Console.WriteLine("\n2. Testing OverwriteMember safety check:");
                 Console.WriteLine("   - Providing just a method signature should trigger safety warning");
                 Console.WriteLine("   - Example: 'public static async Task<object> GetMembers()'");
                 Console.WriteLine("   - Expected: ⚠️ SAFETY WARNING about missing method body");
@@ -43,8 +31,6 @@ namespace TestRunner
                 
                 Console.WriteLine("\n=== All safety improvements implemented successfully! ===");
                 Console.WriteLine("\nKey improvements:");
-                Console.WriteLine("- UpdateToolDescription: Safe attribute updates");
-                Console.WriteLine("- UpdateParameterDescription: Safe parameter description updates");
                 Console.WriteLine("- GetMethodSignature: View signatures without risk");
                 Console.WriteLine("- OverwriteMember: Enhanced with incomplete method detection");
             }

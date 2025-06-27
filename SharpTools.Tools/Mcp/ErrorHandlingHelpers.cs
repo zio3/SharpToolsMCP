@@ -25,28 +25,29 @@ internal static class ErrorHandlingHelpers {
             return await operation();
         } catch (OperationCanceledException) {
             logger.LogWarning("{Operation} operation in {Caller} was cancelled", operationName, callerName);
-            throw new McpException($"Operation '{operationName}' was cancelled.\n💡 This usually happens when the operation takes too long or is interrupted.");
+            throw new McpException($"操作がキャンセルされました: '{operationName}'\n原因: タイムアウトまたは中断");
         } catch (McpException ex) {
             logger.LogError("McpException in {Operation} ({Caller}): {Message}", operationName, callerName, ex.Message);
             throw;
         } catch (ArgumentException ex) {
             logger.LogError(ex, "Invalid argument in {Operation} ({Caller}): {Message}", operationName, callerName, ex.Message);
-            throw new McpException($"❌ Invalid parameter for '{operationName}': {ex.Message}\n💡 Check that all required parameters are provided and correctly formatted.");
+            var paramName = ex.ParamName ?? "unknown";
+            throw new McpException($"引数エラー: '{paramName}' が不正です\n詳細: {ex.Message}\n操作: {operationName}\n必須パラメータを確認してください");
         } catch (InvalidOperationException ex) {
             logger.LogError(ex, "Invalid operation in {Operation} ({Caller}): {Message}", operationName, callerName, ex.Message);
-            throw new McpException($"❌ Operation '{operationName}' failed: {ex.Message}\n💡 This might happen if the target is in an invalid state. Try refreshing the workspace or checking prerequisites.");
+            throw new McpException($"操作エラー: '{operationName}' が失敗しました\n詳細: {ex.Message}\n対象が無効な状態の可能性があります");
         } catch (FileNotFoundException ex) {
             logger.LogError(ex, "File not found in {Operation} ({Caller}): {Message}", operationName, callerName, ex.Message);
-            throw new McpException($"📁 File not found during '{operationName}': {ex.Message}\n💡 Solutions:\n• Verify the file path is correct (use absolute paths for best results)\n• Check if the file was moved or deleted\n• Ensure you have proper file permissions");
+            throw new McpException($"ファイルが見つかりません: {ex.Message}\n操作: '{operationName}'\n対処法:\n• パスが正しいか確認（絶対パス推奨）\n• ファイルが移動・削除されていないか確認");
         } catch (IOException ex) {
             logger.LogError(ex, "IO error in {Operation} ({Caller}): {Message}", operationName, callerName, ex.Message);
-            throw new McpException($"💾 File operation error during '{operationName}': {ex.Message}\n💡 Solutions:\n• Check if the file is open in another application\n• Verify you have write permissions to the directory\n• Ensure there's enough disk space");
+            throw new McpException($"ファイル操作エラー: {ex.Message}\n操作: '{operationName}'\n対処法:\n• ファイルが他のアプリケーションで開かれていないか確認\n• 書き込み権限を確認");
         } catch (UnauthorizedAccessException ex) {
             logger.LogError(ex, "Access denied in {Operation} ({Caller}): {Message}", operationName, callerName, ex.Message);
-            throw new McpException($"🔒 Access denied during '{operationName}': {ex.Message}\n💡 Solutions:\n• Run with administrator privileges if needed\n• Check file and folder permissions\n• Ensure the file isn't read-only or locked by another process");
+            throw new McpException($"アクセス拒否: {ex.Message}\n操作: '{operationName}'\n対処法:\n• ファイル・フォルダの権限を確認\n• 読み取り専用でないか確認");
         } catch (Exception ex) {
             logger.LogError(ex, "Unhandled exception in {Operation} ({Caller}): {Message}", operationName, callerName, ex.Message);
-            throw new McpException($"⚠️ Unexpected error during '{operationName}': {ex.Message}\n💡 This is an unexpected error. Please check the logs for more details and consider reporting this issue.");
+            throw new McpException($"予期しないエラー: {ex.Message}\n操作: '{operationName}'\nログを確認してください");
         }
     }
 
@@ -56,7 +57,7 @@ internal static class ErrorHandlingHelpers {
     public static void ValidateStringParameter(string? value, string paramName, ILogger logger) {
         if (string.IsNullOrWhiteSpace(value)) {
             logger.LogError("Parameter validation failed: {ParamName} is null or empty", paramName);
-            throw new McpException($"❌ Parameter '{paramName}' is required but was empty.\n💡 Provide a valid value for this parameter. Check the tool description for examples.");
+            throw new McpException($"引数エラー: '{paramName}' は必須です\n提供された値: {(value == null ? "null" : "空文字列")}\n正しい使用例を確認してください");
         }
     }
 

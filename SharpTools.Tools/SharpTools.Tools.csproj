@@ -8,12 +8,16 @@
 <PackageReference Include="DiffPlex" Version="1.8.0" />
 <PackageReference Include="ICSharpCode.Decompiler" Version="9.1.0.7988" />
 <PackageReference Include="Microsoft.Build.Locator" Version="1.9.1" />
+<PackageReference Include="Microsoft.CodeAnalysis.Analyzers" Version="4.14.0">
+  <PrivateAssets>all</PrivateAssets>
+  <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+</PackageReference>
 <PackageReference Include="Microsoft.CodeAnalysis.Common" Version="4.14.0" />
 <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.14.0" />
 <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.14.0" />
 <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="4.14.0" />
 <PackageReference Include="Microsoft.Extensions.FileSystemGlobbing" Version="9.0.6" />
-<PackageReference Include="ModelContextProtocol" Version="0.2.0-preview.3" />
+<PackageReference Include="ModelContextProtocol" Version="0.3.0-preview.1" />
 <PackageReference Include="NuGet.Protocol" Version="6.14.0" />
 <PackageReference Include="System.Reflection.Metadata" Version="9.0.6" />
 <PackageReference Include="System.Reflection.MetadataLoadContext" Version="9.0.6" />

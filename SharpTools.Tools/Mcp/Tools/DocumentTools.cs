@@ -3,6 +3,7 @@ using ModelContextProtocol;
 using SharpTools.Tools.Services;
 using SharpTools.Tools.Mcp;
 using SharpTools.Tools.Mcp.Tools;
+using SharpTools.Tools.Mcp.Helpers;
 
 namespace SharpTools.Tools.Mcp.Tools;
 
@@ -31,14 +32,17 @@ _ => false
 }
 
 [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(ReadTypesFromRoslynDocument), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
-[Description("🔍 C# type analysis using Roslyn - comprehensive tree of types (classes, interfaces, structs, etc.) and their members from a specified file. Use filesystem tools for basic file operations.")]
+[Description("🔍 .NET専用 - .cs/.sln/.csprojファイルのみ対応。Roslynを使用したC#タイプ解析")]
 public static async Task<object> ReadTypesFromRoslynDocument(
 StatelessWorkspaceFactory workspaceFactory,
 ICodeAnalysisService codeAnalysisService,
 ILogger<DocumentToolsLogCategory> logger,
-[Description("The absolute path to the file to analyze.")] string filePath,
+[Description("C#ファイル(.cs)の絶対パス")] string filePath,
 CancellationToken cancellationToken) {
 return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
+// 🔍 .NET関連ファイル検証（最優先実行）
+CSharpFileValidationHelper.ValidateDotNetFileForRoslyn(filePath, nameof(ReadTypesFromRoslynDocument), logger);
+
 ErrorHandlingHelpers.ValidateFilePath(filePath, logger);
 ErrorHandlingHelpers.ValidateFileExists(filePath, logger);
 

@@ -1,10 +1,14 @@
 using DiffPlex.DiffBuilder;
 using DiffPlex.DiffBuilder.Model;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.FindSymbols;
 using ModelContextProtocol;
 using SharpTools.Tools.Services;
 using System.Reflection;
 using System.Text.Json;
+using System.ComponentModel;
+using SharpTools.Tools.Mcp.Models;
+using SharpTools.Tools.Mcp.Helpers;
 
 namespace SharpTools.Tools.Mcp.Tools;
 
@@ -35,7 +39,7 @@ public static partial class AnalysisTools {
             // Build signature without duplicates
             var memberModifiers = ToolHelpers.GetRoslynSymbolModifiersString(member);
             var memberBaseSignature = CodeAnalysisService.GetFormattedSignatureAsync(member, false);
-            
+
             // Combine modifiers and signature, avoiding duplicates
             string memberSignature;
             if (!string.IsNullOrWhiteSpace(memberModifiers)) {
@@ -47,7 +51,7 @@ public static partial class AnalysisTools {
             } else {
                 memberSignature = memberBaseSignature;
             }
-            
+
             // Fix duplicate return type issue for methods
             if (member is IMethodSymbol memberMethod) {
                 if (memberMethod.ReturnsVoid) {
@@ -58,7 +62,7 @@ public static partial class AnalysisTools {
                     memberSignature = System.Text.RegularExpressions.Regex.Replace(memberSignature, memberDuplicatePattern, memberReturnType);
                 }
             }
-            
+
             var memberInfo = new {
                 signature = memberSignature,
                 fullyQualifiedName = FuzzyFqnLookupService.GetSearchableString(member),
@@ -376,6 +380,43 @@ public static partial class AnalysisTools {
         public int StartLine { get; set; }
         public int EndLine { get; set; }
     }
+
+    public class MethodSignatureResult {
+        public string SearchTerm { get; set; } = string.Empty;
+        public int TotalMatches { get; set; }
+        public List<MethodDetail> Methods { get; set; } = new();
+        public string? Note { get; set; }
+        
+        public override string ToString() {
+            return ToolHelpers.ToJson(this);
+        }
+    }
+
+    public class MethodDetail {
+        public string Name { get; set; } = string.Empty;
+        public string Signature { get; set; } = string.Empty;
+        public string FullyQualifiedName { get; set; } = string.Empty;
+        public string ContainingType { get; set; } = string.Empty;
+        public string ReturnType { get; set; } = string.Empty;
+        public List<ParameterDetail> Parameters { get; set; } = new();
+        public LocationInfo? Location { get; set; }
+        public string? Documentation { get; set; }
+        public XmlDocumentation? StructuredDocumentation { get; set; }
+        public List<string> Modifiers { get; set; } = new();
+        public double MatchScore { get; set; }
+        public string MatchReason { get; set; } = string.Empty;
+        public bool IsOverloaded { get; set; }
+        public string? GenericConstraints { get; set; }
+    }
+
+    public class ParameterDetail {
+        public string Name { get; set; } = string.Empty;
+        public string Type { get; set; } = string.Empty;
+        public bool IsOptional { get; set; }
+        public string? DefaultValue { get; set; }
+        public string? Documentation { get; set; }
+        public List<string> Modifiers { get; set; } = new(); // ref, out, in, params
+    }
     private static List<LocationInfo> GetDeclarationLocationInfo(ISymbol symbol) {
         var locations = new List<LocationInfo>();
 
@@ -430,24 +471,27 @@ public static partial class AnalysisTools {
     #region Main Methods
 
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(GetMembers), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
-    [Description("Display members (methods, properties, fields) of classes and interfaces. Perfect for understanding APIs and implementation details")]
+    [Description("🔍 .NET専用 - .cs/.sln/.csprojファイルのみ対応。クラスやインターフェースのメンバー（メソッド、プロパティ、フィールド）を表示")]
     public static async Task<object> GetMembers(
     StatelessWorkspaceFactory workspaceFactory,
     ICodeAnalysisService codeAnalysisService,
     IFuzzyFqnLookupService fuzzyFqnLookupService,
     ILogger<AnalysisToolsLogCategory> logger,
-    [Description("Path to your project file (.csproj), solution (.sln), or any C# file in the project")] string contextPath,
-    [Description("Target class name to analyze. Use fully qualified name (MyApp.Services.UserService) or short name (UserService)")] string fullyQualifiedTypeName,
+    [Description(".NETソリューション(.sln)またはプロジェクト(.csproj)ファイルのパス")] string solutionOrProjectPath,
+    [Description("Class name to analyze (e.g., 'UserService' or 'MyApp.Services.UserService')")] string classNameOrFqn,
     [Description("Include private members in results (true=show all, false=public only)")] bool includePrivateMembers,
     CancellationToken cancellationToken = default) {
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
-            ErrorHandlingHelpers.ValidateStringParameter(contextPath, nameof(contextPath), logger);
-            ErrorHandlingHelpers.ValidateStringParameter(fullyQualifiedTypeName, nameof(fullyQualifiedTypeName), logger);
+            // 🔍 .NET関連ファイル検証（最優先実行）
+            CSharpFileValidationHelper.ValidateDotNetFileForRoslyn(solutionOrProjectPath, nameof(GetMembers), logger);
+            
+            ErrorHandlingHelpers.ValidateStringParameter(solutionOrProjectPath, nameof(solutionOrProjectPath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(classNameOrFqn, nameof(classNameOrFqn), logger);
 
-            logger.LogInformation("Executing '{GetMembers}' for: {TypeName} in context {ContextPath} (IncludePrivate: {IncludePrivate})",
-                nameof(GetMembers), fullyQualifiedTypeName, contextPath, includePrivateMembers);
+            logger.LogInformation("Executing '{GetMembers}' for: {TypeName} in context {ProjectOrFilePath} (IncludePrivate: {IncludePrivate})",
+                nameof(GetMembers), classNameOrFqn, solutionOrProjectPath, includePrivateMembers);
 
-            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(contextPath);
+            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(solutionOrProjectPath);
 
             try {
                 Solution solution;
@@ -461,10 +505,10 @@ public static partial class AnalysisTools {
                 }
 
                 // Use fuzzy lookup to find the symbol
-                var fuzzyMatches = await fuzzyFqnLookupService.FindMatchesAsync(fullyQualifiedTypeName, new StatelessSolutionManager(solution), cancellationToken);
+                var fuzzyMatches = await fuzzyFqnLookupService.FindMatchesAsync(classNameOrFqn, new StatelessSolutionManager(solution), cancellationToken);
                 var bestMatch = fuzzyMatches.FirstOrDefault();
                 if (bestMatch == null || !(bestMatch.Symbol is INamedTypeSymbol namedTypeSymbol)) {
-                    throw new McpException($"🔍 型が見つかりません: '{fullyQualifiedTypeName}'\n💡 確認方法:\n• {ToolHelpers.SharpToolPrefix}{nameof(Tools.DocumentTools.ReadTypesFromRoslynDocument)} で利用可能な型を確認\n• 完全修飾名（MyApp.Models.User）で試してください\n• 名前空間が正しいかを確認");
+                    throw new McpException($"型が見つかりません: '{classNameOrFqn}'\n確認方法:\n• {ToolHelpers.SharpToolPrefix}{nameof(Tools.DocumentTools.ReadTypesFromRoslynDocument)} で利用可能な型を確認\n• 完全修飾名（例: MyApp.Models.User）または短縮名（例: User）で試してください\n• 名前空間が正しいかを確認");
                 }
 
                 string typeName = ToolHelpers.RemoveGlobalPrefix(namedTypeSymbol.ToDisplayString(ToolHelpers.FullyQualifiedFormatWithoutGlobal));
@@ -495,11 +539,11 @@ public static partial class AnalysisTools {
 
                             var kind = ToolHelpers.GetSymbolKindString(member);
                             string xmlDocs = await codeAnalysisService.GetXmlDocumentationAsync(member, cancellationToken) ?? string.Empty;
-                            
+
                             // Build signature without duplicates
                             var modifiers = ToolHelpers.GetRoslynSymbolModifiersString(member);
                             var baseSignature = CodeAnalysisService.GetFormattedSignatureAsync(member, false).Replace(typeName + ".", string.Empty).Trim();
-                            
+
                             // Combine modifiers and signature, avoiding duplicates
                             string signature;
                             if (!string.IsNullOrWhiteSpace(modifiers)) {
@@ -511,7 +555,7 @@ public static partial class AnalysisTools {
                             } else {
                                 signature = baseSignature;
                             }
-                            
+
                             // Fix duplicate return type issue for methods
                             if (member is IMethodSymbol methodSymbol) {
                                 if (methodSymbol.ReturnsVoid) {
@@ -522,7 +566,7 @@ public static partial class AnalysisTools {
                                     signature = System.Text.RegularExpressions.Regex.Replace(signature, duplicatePattern, returnType);
                                 }
                             }
-                            
+
                             // Add XML documentation comment if available
                             if (!string.IsNullOrEmpty(xmlDocs)) {
                                 signature += $" // {xmlDocs.Replace("\n", " ").Replace("\r", "")}";
@@ -538,45 +582,160 @@ public static partial class AnalysisTools {
 
                             membersByLocation[locationKey][kind].Add(signature);
                         } catch (Exception ex) {
-                            logger.LogWarning(ex, "Error processing member {MemberName} in {TypeName}", member.Name, fullyQualifiedTypeName);
+                            logger.LogWarning(ex, "Error processing member {MemberName} in {TypeName}", member.Name, classNameOrFqn);
                         }
                     }
                 }
 
+                // Build structured result
+                var result = new GetMembersResult {
+                    ClassName = namedTypeSymbol.Name,
+                    FullyQualifiedName = namedTypeSymbol.ToDisplayString(ToolHelpers.FullyQualifiedFormatWithoutGlobal),
+                    IsPartial = namedTypeSymbol.Locations.Length > 1
+                };
+
+                // Add file path from first location
                 var typeLocations = GetDeclarationLocationInfo(namedTypeSymbol);
-                return ToolHelpers.ToJson(new {
-                    kind = ToolHelpers.GetSymbolKindString(namedTypeSymbol),
-                    signature = ToolHelpers.GetRoslynSymbolModifiersString(namedTypeSymbol) + " " + namedTypeSymbol.ToDisplayString(ToolHelpers.FullyQualifiedFormatWithoutGlobal),
-                    xmlDocs = await codeAnalysisService.GetXmlDocumentationAsync(namedTypeSymbol, cancellationToken) ?? string.Empty,
-                    note = $"💡 Next steps: Use {ToolHelpers.SharpToolPrefix}{nameof(GetMethodSignature)} to see method signatures, or {ToolHelpers.SharpToolPrefix}{nameof(GetMembers)} to explore type members.",
-                    locations = typeLocations,
-                    includesPrivateMembers = includePrivateMembers,
-                    membersByLocation = membersByLocation
-                });
+                if (typeLocations.Any()) {
+                    result.FilePath = typeLocations.First().FilePath;
+                }
+
+                // Add base types and interfaces
+                if (namedTypeSymbol.BaseType != null && namedTypeSymbol.BaseType.SpecialType != SpecialType.System_Object) {
+                    result.BaseTypes.Add(namedTypeSymbol.BaseType.ToDisplayString());
+                }
+                result.Interfaces.AddRange(namedTypeSymbol.Interfaces.Select(i => i.ToDisplayString()));
+
+                // Build member list with detailed info
+                var memberList = new List<MemberDetail>();
+                foreach (var member in namedTypeSymbol.GetMembers()) {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    if (member.IsImplicitlyDeclared || ToolHelpers.IsPropertyAccessor(member)) {
+                        continue;
+                    }
+
+                    bool shouldInclude = includePrivateMembers ||
+                        member.DeclaredAccessibility == Accessibility.Public ||
+                        member.DeclaredAccessibility == Accessibility.Internal ||
+                        member.DeclaredAccessibility == Accessibility.Protected ||
+                        member.DeclaredAccessibility == Accessibility.ProtectedAndInternal ||
+                        member.DeclaredAccessibility == Accessibility.ProtectedOrInternal;
+
+                    if (shouldInclude) {
+                        var memberInfo = new MemberDetail {
+                            Name = member.Name,
+                            Type = ToolHelpers.GetSymbolKindString(member),
+                            FullyQualifiedName = FuzzyFqnLookupService.GetSearchableString(member),
+                            Accessibility = member.DeclaredAccessibility.ToString()
+                        };
+
+                        // Get modifiers
+                        var modifiers = ToolHelpers.GetRoslynSymbolModifiersString(member);
+                        if (!string.IsNullOrWhiteSpace(modifiers)) {
+                            memberInfo.Modifiers.AddRange(modifiers.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+                        }
+
+                        // Build signature
+                        var baseSignature = CodeAnalysisService.GetFormattedSignatureAsync(member, false);
+                        memberInfo.Signature = !string.IsNullOrWhiteSpace(modifiers) && !baseSignature.StartsWith(modifiers)
+                            ? $"{modifiers} {baseSignature}".Trim()
+                            : baseSignature;
+
+                        // Method-specific info
+                        if (member is IMethodSymbol methodSymbol) {
+                            memberInfo.ReturnType = methodSymbol.ReturnType.ToDisplayString();
+                            memberInfo.Parameters = methodSymbol.Parameters.Select(p => new Models.ParameterInfo {
+                                Name = p.Name,
+                                Type = p.Type.ToDisplayString(),
+                                DefaultValue = p.HasExplicitDefaultValue ? p.ExplicitDefaultValue?.ToString() : null,
+                                Modifiers = p.RefKind switch {
+                                    RefKind.Ref => new List<string> { "ref" },
+                                    RefKind.Out => new List<string> { "out" },
+                                    RefKind.In => new List<string> { "in" },
+                                    _ => new List<string>()
+                                }
+                            }).ToList();
+                        }
+                        // Property-specific info
+                        else if (member is IPropertySymbol propertySymbol) {
+                            memberInfo.ReturnType = propertySymbol.Type.ToDisplayString();
+                        }
+                        // Field-specific info
+                        else if (member is IFieldSymbol fieldSymbol) {
+                            memberInfo.ReturnType = fieldSymbol.Type.ToDisplayString();
+                        }
+
+                        // Location info
+                        var locationInfo = GetDeclarationLocationInfo(member);
+                        if (locationInfo.Any()) {
+                            var loc = locationInfo.First();
+                            memberInfo.Location = new MemberLocation {
+                                FilePath = loc.FilePath,
+                                Line = loc.StartLine,
+                                Column = 1 // Column information not available in LocationInfo
+                            };
+                        }
+
+                        // XML documentation
+                        memberInfo.XmlDocs = await codeAnalysisService.GetXmlDocumentationAsync(member, cancellationToken);
+
+                        // Attributes
+                        memberInfo.Attributes.AddRange(member.GetAttributes().Select(a => a.AttributeClass?.ToDisplayString() ?? ""));
+
+                        memberList.Add(memberInfo);
+                    }
+                }
+
+                result.Members = memberList;
+
+                // Add nested types
+                result.NestedTypes.AddRange(
+                    namedTypeSymbol.GetTypeMembers()
+                        .Select(t => t.ToDisplayString())
+                );
+
+                // Calculate statistics
+                result.Statistics = new ClassStatistics {
+                    TotalMembers = memberList.Count,
+                    PublicMembers = memberList.Count(m => m.Accessibility == "Public"),
+                    PrivateMembers = memberList.Count(m => m.Accessibility == "Private"),
+                    ProtectedMembers = memberList.Count(m => m.Accessibility == "Protected"),
+                    InternalMembers = memberList.Count(m => m.Accessibility == "Internal"),
+                    MethodCount = memberList.Count(m => m.Type == "Method"),
+                    PropertyCount = memberList.Count(m => m.Type == "Property"),
+                    FieldCount = memberList.Count(m => m.Type == "Field"),
+                    EventCount = memberList.Count(m => m.Type == "Event"),
+                    NestedTypeCount = result.NestedTypes.Count
+                };
+
+                return result;
             } finally {
                 workspace?.Dispose();
             }
         }, logger, nameof(GetMembers), cancellationToken);
     }
-
     [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(GetMethodSignature), Idempotent = true, ReadOnly = true, Destructive = false, OpenWorld = false)]
-    [Description("🔍 Safely view method signature without the body. Perfect for checking before using OverwriteMember. Example: 'MyClass.ProcessData'")]
-    public static async Task<string> GetMethodSignature(
+    [Description("🔍 .NET専用 - .cs/.sln/.csprojファイルのみ対応。メソッドシグネチャを確認（本体なし）")]
+    public static async Task<object> GetMethodSignature(
         StatelessWorkspaceFactory workspaceFactory,
         ICodeAnalysisService codeAnalysisService,
         IFuzzyFqnLookupService fuzzyFqnLookupService,
         ILogger<AnalysisToolsLogCategory> logger,
-        [Description("Path to your project file (.csproj), solution (.sln), or any C# file in the project")] string contextPath,
-        [Description("The method name. Examples: 'MyClass.ProcessData', 'ProcessData', or full FQN")] string methodIdentifier,
+        [Description(".NETソリューション(.sln)またはプロジェクト(.csproj)ファイルのパス")] string solutionOrProjectPath,
+        [Description("Method name (e.g., 'ProcessData', 'MyClass.ProcessData', or full FQN)")] string methodName,
         CancellationToken cancellationToken = default) {
         return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync(async () => {
-            ErrorHandlingHelpers.ValidateStringParameter(contextPath, nameof(contextPath), logger);
-            ErrorHandlingHelpers.ValidateStringParameter(methodIdentifier, nameof(methodIdentifier), logger);
+            // 🔍 .NET関連ファイル検証（最優先実行）
+            CSharpFileValidationHelper.ValidateDotNetFileForRoslyn(solutionOrProjectPath, nameof(GetMethodSignature), logger);
+            
+            ErrorHandlingHelpers.ValidateStringParameter(solutionOrProjectPath, nameof(solutionOrProjectPath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(methodName, nameof(methodName), logger);
 
-            logger.LogInformation("Executing '{GetMethodSignature}' for: {MethodIdentifier} in context {ContextPath}",
-                nameof(GetMethodSignature), methodIdentifier, contextPath);
+            logger.LogInformation("Executing '{GetMethodSignature}' for: {MethodName} in context {ProjectOrFilePath}",
+                nameof(GetMethodSignature), methodName, solutionOrProjectPath);
 
-            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(contextPath);
+            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(solutionOrProjectPath);
 
             try {
                 Solution solution;
@@ -589,130 +748,498 @@ public static partial class AnalysisTools {
                     solution = ((Project)dynamicContext.Project).Solution;
                 }
 
-                // Use fuzzy lookup to find the symbol
-                var fuzzyMatches = await fuzzyFqnLookupService.FindMatchesAsync(methodIdentifier, new StatelessSolutionManager(solution), cancellationToken);
-                
-                // Find the best match considering parameter types if specified
-                FuzzyMatchResult? bestMatch = null;
-                IMethodSymbol? methodSymbol = null;
-                
-                // Check if the identifier includes parameter types (e.g., "Method(System.String)")
-                bool hasParameterSpecification = methodIdentifier.Contains("(");
-                
-                if (hasParameterSpecification) {
-                    // Try to find exact match based on parameter types
-                    foreach (var match in fuzzyMatches.Where(m => m.Symbol is IMethodSymbol)) {
-                        if (match.Symbol is IMethodSymbol method) {
-                            // Build the full signature for comparison
-                            var methodFullSig = $"{method.ContainingType.ToDisplayString()}.{method.Name}({string.Join(", ", method.Parameters.Select(p => p.Type.ToDisplayString()))})";
-                            var methodSimpleSig = $"{method.ContainingType.Name}.{method.Name}({string.Join(", ", method.Parameters.Select(p => p.Type.ToDisplayString()))})";
-                            var methodOnlySig = $"{method.Name}({string.Join(", ", method.Parameters.Select(p => p.Type.ToDisplayString()))})";
-                            
-                            // Normalize type names for comparison (System.String -> string, etc.)
-                            var normalizedIdentifier = methodIdentifier
-                                .Replace("System.String", "string")
-                                .Replace("System.Int32", "int")
-                                .Replace("System.Int64", "long")
-                                .Replace("System.Boolean", "bool")
-                                .Replace("System.Double", "double")
-                                .Replace("System.Single", "float")
-                                .Replace("System.Decimal", "decimal")
-                                .Replace("System.Byte", "byte")
-                                .Replace("System.Char", "char")
-                                .Replace("System.Object", "object");
-                            
-                            if (methodFullSig == methodIdentifier || 
-                                methodSimpleSig == methodIdentifier || 
-                                methodOnlySig == methodIdentifier ||
-                                methodFullSig == normalizedIdentifier ||
-                                methodSimpleSig == normalizedIdentifier ||
-                                methodOnlySig == normalizedIdentifier) {
-                                bestMatch = match;
-                                methodSymbol = method;
-                                break;
-                            }
-                        }
+                // 改善されたFuzzyFqnLookupServiceで検索
+                var fuzzyMatches = await fuzzyFqnLookupService.FindMatchesAsync(methodName, new StatelessSolutionManager(solution), cancellationToken);
+                var methodMatches = fuzzyMatches
+                    .Where(m => m.Symbol is IMethodSymbol)
+                    .OrderByDescending(m => m.Score)
+                    .Take(10) // 最大10件の候補を返す
+                    .ToList();
+
+                if (!methodMatches.Any()) {
+                    var availableMethodsHint = "";
+                    if (!methodName.Contains(".")) {
+                        availableMethodsHint = "\n• より具体的に: 'ClassName.MethodName' の形式で試してください";
+                    } else if (methodName.Split('.').Length == 2) {
+                        availableMethodsHint = "\n• より具体的に: 'Namespace.ClassName.MethodName' の形式で試してください";
                     }
-                }
-                
-                // If no exact match found, fall back to first method match
-                if (bestMatch == null) {
-                    bestMatch = fuzzyMatches.FirstOrDefault(m => m.Symbol is IMethodSymbol);
-                    if (bestMatch != null && bestMatch.Symbol is IMethodSymbol ms) {
-                        methodSymbol = ms;
-                    }
+                    
+                    throw new McpException($"メソッドが見つかりません: '{methodName}'\n確認方法:\n• {ToolHelpers.SharpToolPrefix}{nameof(GetMembers)} で利用可能なメソッドを確認{availableMethodsHint}\n• 型名とメソッド名が正しいかを確認");
                 }
 
-                if (bestMatch == null || methodSymbol == null) {
-                    throw new McpException($"🔍 メソッドが見つかりません: '{methodIdentifier}'\n💡 確認方法:\n• {ToolHelpers.SharpToolPrefix}{nameof(GetMembers)} で利用可能なメソッドを確認\n• 完全修飾名（MyClass.MyMethod）で試してください\n• 型名とメソッド名が正しいかを確認");
+                // オーバーロード検出
+                var methodsByName = methodMatches.GroupBy(m => ((IMethodSymbol)m.Symbol).Name).ToList();
+                var overloadedMethods = methodsByName.Where(g => g.Count() > 1).SelectMany(g => g).ToHashSet();
+
+                // 構造化されたメソッド詳細を構築
+                var methods = new List<MethodDetail>();
+                foreach (var match in methodMatches) {
+                    var methodSymbol = (IMethodSymbol)match.Symbol;
+                    var methodDetail = await BuildStructuredMethodDetail(methodSymbol, match, codeAnalysisService, cancellationToken);
+                    methodDetail.IsOverloaded = overloadedMethods.Contains(match);
+                    methods.Add(methodDetail);
                 }
 
-                // Get the declaration location
-                var locationInfo = GetDeclarationLocationInfo(methodSymbol);
-                var location = locationInfo.FirstOrDefault();
+                // 結果オブジェクトの構築
+                var result = new MethodSignatureResult {
+                    SearchTerm = methodName,
+                    TotalMatches = methodMatches.Count,
+                    Methods = methods,
+                    Note = $"Use these signatures with {ToolHelpers.SharpToolPrefix}OverwriteMember to safely update methods"
+                };
 
-                // Build the signature
-                var modifiers = ToolHelpers.GetRoslynSymbolModifiersString(methodSymbol);
-                var signature = CodeAnalysisService.GetFormattedSignatureAsync(methodSymbol, false);
-                
-                // Combine modifiers and signature, avoiding duplicates
-                string fullSignature;
-                if (!string.IsNullOrWhiteSpace(modifiers)) {
-                    // Check if signature already starts with the modifiers
-                    if (signature.StartsWith(modifiers)) {
-                        fullSignature = signature;
-                    } else {
-                        fullSignature = $"{modifiers} {signature}".Trim();
-                    }
-                } else {
-                    fullSignature = signature;
-                }
-                
-                // Additional fix for duplicate return type issue
-                if (methodSymbol.ReturnsVoid) {
-                    fullSignature = System.Text.RegularExpressions.Regex.Replace(fullSignature, @"\bvoid\s+void\b", "void");
-                } else {
-                    var returnType = methodSymbol.ReturnType.ToDisplayString();
-                    var duplicatePattern = $@"\b{System.Text.RegularExpressions.Regex.Escape(returnType)}\s+{System.Text.RegularExpressions.Regex.Escape(returnType)}\b";
-                    fullSignature = System.Text.RegularExpressions.Regex.Replace(fullSignature, duplicatePattern, returnType);
-                }
-
-                // Get XML documentation if available
-                string xmlDocs = await codeAnalysisService.GetXmlDocumentationAsync(methodSymbol, cancellationToken) ?? string.Empty;
-
-                // Get parameter descriptions
-                var parameterDescriptions = new List<string>();
-                foreach (var parameter in methodSymbol.Parameters) {
-                    var paramXmlDoc = await codeAnalysisService.GetXmlDocumentationAsync(parameter, cancellationToken);
-                    if (!string.IsNullOrEmpty(paramXmlDoc)) {
-                        parameterDescriptions.Add($"  - {parameter.Name}: {paramXmlDoc}");
-                    }
-                }
-
-                var result = new System.Text.StringBuilder();
-                result.AppendLine($"📋 Method Signature for '{methodSymbol.Name}':");
-                result.AppendLine($"   Location: {location?.FilePath ?? "Unknown"} (Line {location?.StartLine ?? 0})");
-                result.AppendLine($"   Signature: {fullSignature}");
-
-                if (!string.IsNullOrEmpty(xmlDocs)) {
-                    result.AppendLine($"   Documentation: {xmlDocs}");
-                }
-
-                if (parameterDescriptions.Any()) {
-                    result.AppendLine("   Parameters:");
-                    foreach (var desc in parameterDescriptions) {
-                        result.AppendLine(desc);
-                    }
-                }
-
-                result.AppendLine($"\n💡 Use this signature with {ToolHelpers.SharpToolPrefix}OverwriteMember to safely update the method");
-
-                return result.ToString();
+                return result;
             } finally {
                 workspace?.Dispose();
             }
         }, logger, nameof(GetMethodSignature), cancellationToken);
     }
 
+    // 構造化されたメソッド詳細を構築するヘルパーメソッド
+    private static async Task<MethodDetail> BuildStructuredMethodDetail(IMethodSymbol methodSymbol, FuzzyMatchResult match, ICodeAnalysisService codeAnalysisService, CancellationToken cancellationToken) {
+        // 基本情報の取得
+        var locationInfo = GetDeclarationLocationInfo(methodSymbol);
+        var location = locationInfo.FirstOrDefault();
+        
+        // シグネチャ構築
+        var modifiers = ToolHelpers.GetRoslynSymbolModifiersString(methodSymbol);
+        var signature = CodeAnalysisService.GetFormattedSignatureAsync(methodSymbol, false);
+        
+        string fullSignature;
+        if (!string.IsNullOrWhiteSpace(modifiers)) {
+            if (signature.StartsWith(modifiers)) {
+                fullSignature = signature;
+            } else {
+                fullSignature = $"{modifiers} {signature}".Trim();
+            }
+        } else {
+            fullSignature = signature;
+        }
+        
+        // 重複除去
+        if (methodSymbol.ReturnsVoid) {
+            fullSignature = System.Text.RegularExpressions.Regex.Replace(fullSignature, @"\bvoid\s+void\b", "void");
+        } else {
+            var returnType = methodSymbol.ReturnType.ToDisplayString();
+            var duplicatePattern = $@"\b{System.Text.RegularExpressions.Regex.Escape(returnType)}\s+{System.Text.RegularExpressions.Regex.Escape(returnType)}\b";
+            fullSignature = System.Text.RegularExpressions.Regex.Replace(fullSignature, duplicatePattern, returnType);
+        }
+        
+        // パラメータ詳細の構築
+        var parameters = new List<ParameterDetail>();
+        foreach (var parameter in methodSymbol.Parameters) {
+            var paramModifiers = new List<string>();
+            if (parameter.RefKind == RefKind.Ref) paramModifiers.Add("ref");
+            else if (parameter.RefKind == RefKind.Out) paramModifiers.Add("out");
+            else if (parameter.RefKind == RefKind.In) paramModifiers.Add("in");
+            if (parameter.IsParams) paramModifiers.Add("params");
+            
+            var paramDoc = await codeAnalysisService.GetXmlDocumentationAsync(parameter, cancellationToken);
+            
+            string? defaultValue = null;
+            if (parameter.HasExplicitDefaultValue && parameter.ExplicitDefaultValue != null) {
+                try {
+                    defaultValue = parameter.ExplicitDefaultValue.ToString();
+                } catch {
+                    defaultValue = "<unknown>";
+                }
+            }
+            
+            parameters.Add(new ParameterDetail {
+                Name = parameter.Name,
+                Type = parameter.Type.ToDisplayString(),
+                IsOptional = parameter.HasExplicitDefaultValue,
+                DefaultValue = defaultValue,
+                Documentation = paramDoc,
+                Modifiers = paramModifiers
+            });
+        }
+        
+        // XML文書化の取得
+        string xmlDocs = await codeAnalysisService.GetXmlDocumentationAsync(methodSymbol, cancellationToken) ?? string.Empty;
+        
+        // 修飾子の分析
+        var modifiersList = string.IsNullOrWhiteSpace(modifiers) 
+            ? new List<string>() 
+            : modifiers.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList();
+        
+        // ジェネリック制約の取得
+        string? genericConstraints = null;
+        if (methodSymbol.IsGenericMethod) {
+            var constraints = methodSymbol.TypeParameters
+                .Where(tp => tp.ConstraintTypes.Any() || tp.HasReferenceTypeConstraint || tp.HasValueTypeConstraint || tp.HasUnmanagedTypeConstraint)
+                .Select(tp => {
+                    var constraintParts = new List<string>();
+                    if (tp.HasReferenceTypeConstraint) constraintParts.Add("class");
+                    if (tp.HasValueTypeConstraint) constraintParts.Add("struct");
+                    if (tp.HasUnmanagedTypeConstraint) constraintParts.Add("unmanaged");
+                    constraintParts.AddRange(tp.ConstraintTypes.Select(ct => ct.ToDisplayString()));
+                    return $"where {tp.Name} : {string.Join(", ", constraintParts)}";
+                });
+            
+            if (constraints.Any()) {
+                genericConstraints = string.Join(" ", constraints);
+            }
+        }
+        
+        return new MethodDetail {
+            Name = methodSymbol.Name,
+            Signature = fullSignature,
+            FullyQualifiedName = FuzzyFqnLookupService.GetSearchableString(methodSymbol),
+            ContainingType = methodSymbol.ContainingType.ToDisplayString(),
+            ReturnType = methodSymbol.ReturnType.ToDisplayString(),
+            Parameters = parameters,
+            Location = location,
+            Documentation = xmlDocs,
+            StructuredDocumentation = XmlDocumentationParser.ParseXmlDocumentation(xmlDocs),
+            Modifiers = modifiersList,
+            MatchScore = match.Score,
+            MatchReason = match.MatchReason,
+            IsOverloaded = false, // この値は後で設定される
+            GenericConstraints = genericConstraints
+        };
+    }
+
+
     #endregion
+
+    [McpServerTool(Name = ToolHelpers.SharpToolPrefix + nameof(FindUsages), Idempotent = true, Destructive = false, OpenWorld = true, ReadOnly = true)]
+    [Description("🔍 .NET専用 - .sln/.csprojファイルのみ対応。プロジェクト全体でシンボルの使用箇所を検索")]
+    public static async Task<object> FindUsages(
+        StatelessWorkspaceFactory workspaceFactory,
+        ILogger<AnalysisToolsLogCategory> logger,
+        [Description(".NETソリューション(.sln)またはプロジェクト(.csproj)ファイルのパス")] string solutionOrProjectPath,
+        [Description("検索対象のシンボル名（クラス名、メソッド名、プロパティ名など）")] string symbolName,
+        [Description("検索結果の最大件数（デフォルト: 100）")] int maxResults = 100,
+        [Description("プライベートメンバーも含めるか（デフォルト: true）")] bool includePrivateMembers = true,
+        [Description("継承されたメンバーも含めるか（デフォルト: false）")] bool includeInheritedMembers = false,
+        [Description("外部ライブラリのシンボルも検索するか（デフォルト: true）")] bool includeExternalSymbols = true,
+        [Description("検索モード: 'declaration'(宣言のみ) | 'usage'(使用箇所) | 'all'(両方)（デフォルト: 'all'）")] string searchMode = "all",
+        CancellationToken cancellationToken = default) {
+        
+        return await ErrorHandlingHelpers.ExecuteWithErrorHandlingAsync<object, AnalysisToolsLogCategory>(async () => {
+            // 🔍 .NET関連ファイル検証（最優先実行）
+            CSharpFileValidationHelper.ValidateDotNetFileForRoslyn(solutionOrProjectPath, nameof(FindUsages), logger);
+            
+            ErrorHandlingHelpers.ValidateStringParameter(solutionOrProjectPath, nameof(solutionOrProjectPath), logger);
+            ErrorHandlingHelpers.ValidateStringParameter(symbolName, nameof(symbolName), logger);
+
+            logger.LogInformation("Executing '{FindUsages}' for symbol: {SymbolName} in {FilePath}",
+                nameof(FindUsages), symbolName, solutionOrProjectPath);
+
+            var (workspace, context, contextType) = await workspaceFactory.CreateForContextAsync(solutionOrProjectPath);
+
+            try {
+                Solution solution;
+                if (context is Solution sol) {
+                    solution = sol;
+                } else if (context is Project proj) {
+                    solution = proj.Solution;
+                } else {
+                    // For other contexts (e.g., Document), get the solution through the project
+                    var dynamicContext = (dynamic)context;
+                    solution = ((Project)dynamicContext.Project).Solution;
+                }
+
+                if (solution.Projects.Count() == 0) {
+                    throw new McpException($"プロジェクトが見つかりません: {solutionOrProjectPath}");
+                }
+
+                // Find symbols by name across all projects
+                var allSymbols = new List<ISymbol>();
+                foreach (var project in solution.Projects) {
+                    var compilation = await project.GetCompilationAsync(cancellationToken);
+                    if (compilation == null) continue;
+
+                    var symbols = await GetSymbolsByNameEnhanced(
+                        compilation, 
+                        symbolName, 
+                        includePrivateMembers, 
+                        includeInheritedMembers,
+                        includeExternalSymbols,
+                        searchMode,
+                        cancellationToken);
+                    allSymbols.AddRange(symbols);
+                }
+
+                // Remove duplicates and limit search targets
+                var targetSymbols = allSymbols
+                    .Distinct(SymbolEqualityComparer.Default)
+                    .Take(10) // Limit to top 10 symbols for performance
+                    .ToList();
+
+                if (targetSymbols.Count == 0) {
+                    return new FindUsagesResult {
+                        SearchTerm = symbolName,
+                        SymbolsFound = new List<FoundSymbol>(),
+                        TotalReferences = 0,
+                        References = new List<FileUsage>(),
+                        Summary = new FindUsagesSummary {
+                            AffectedFileCount = 0,
+                            Truncated = false
+                        },
+                        Message = $"シンボル '{symbolName}' が見つかりませんでした"
+                    };
+                }
+
+                // Find references for each symbol
+                var allReferences = new List<SymbolReferenceLocation>();
+                foreach (var symbol in targetSymbols) {
+                    var references = await SymbolFinder.FindReferencesAsync(symbol, solution, cancellationToken);
+                    
+                    foreach (var reference in references) {
+                        foreach (var location in reference.Locations) {
+                            if (location.Location.IsInSource && location.Document?.FilePath != null) {
+                                var contextText = await GetContextText(location.Document, location.Location, cancellationToken);
+                                var lineSpan = location.Location.GetLineSpan();
+                                
+                                allReferences.Add(new SymbolReferenceLocation {
+                                    SymbolName = symbol.Name,
+                                    SymbolKind = symbol.Kind.ToString(),
+                                    FilePath = location.Document.FilePath,
+                                    LineNumber = lineSpan.StartLinePosition.Line + 1,
+                                    ColumnNumber = lineSpan.StartLinePosition.Character + 1,
+                                    ContextText = contextText
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Group results by file and create response
+                var groupedReferences = allReferences
+                    .OrderBy(r => r.FilePath)
+                    .ThenBy(r => r.LineNumber)
+                    .Take(maxResults)
+                    .GroupBy(r => r.FilePath)
+                    .Select(group => new FileUsage {
+                        FilePath = group.Key ?? "",
+                        ReferenceCount = group.Count(),
+                        Locations = group.Select(r => new UsageLocation {
+                            Line = r.LineNumber,
+                            Column = r.ColumnNumber,
+                            Context = r.ContextText,
+                            SymbolKind = r.SymbolKind
+                        }).ToList()
+                    }).ToList();
+
+                return new FindUsagesResult {
+                    SearchTerm = symbolName,
+                    SymbolsFound = targetSymbols.Select(s => new FoundSymbol {
+                        Name = s.Name,
+                        Kind = s.Kind.ToString(),
+                        FullyQualifiedName = s.ToDisplayString(),
+                        ContainingType = s.ContainingType?.Name
+                    }).ToList(),
+                    TotalReferences = allReferences.Count,
+                    References = groupedReferences,
+                    Summary = new FindUsagesSummary {
+                        AffectedFileCount = allReferences.Select(r => r.FilePath).Distinct().Count(),
+                        Truncated = allReferences.Count > maxResults
+                    }
+                };
+
+            } finally {
+                workspace.Dispose();
+            }
+        }, logger, nameof(FindUsages), cancellationToken);
+    }
+
+    private static List<ISymbol> GetSymbolsByName(Compilation compilation, string symbolName, bool includePrivateMembers, bool includeInheritedMembers) {
+        var symbols = new List<ISymbol>();
+        
+        // Search through all types in the compilation
+        foreach (var syntaxTree in compilation.SyntaxTrees) {
+            var semanticModel = compilation.GetSemanticModel(syntaxTree);
+            var root = syntaxTree.GetRoot();
+            
+            // Find all declarations
+            var declarations = root.DescendantNodes()
+                .Where(n => n is BaseTypeDeclarationSyntax ||
+                           n is MethodDeclarationSyntax ||
+                           n is PropertyDeclarationSyntax ||
+                           n is FieldDeclarationSyntax ||
+                           n is EventDeclarationSyntax);
+            
+            foreach (var declaration in declarations) {
+                var symbol = semanticModel.GetDeclaredSymbol(declaration);
+                if (symbol != null && symbol.Name.Equals(symbolName, StringComparison.OrdinalIgnoreCase)) {
+                    if (includePrivateMembers || symbol.DeclaredAccessibility != Accessibility.Private) {
+                        symbols.Add(symbol);
+                    }
+                }
+            }
+        }
+        
+        return symbols.Distinct(SymbolEqualityComparer.Default).ToList();
+    }
+
+    private static async Task<List<ISymbol>> GetSymbolsByNameEnhanced(
+        Compilation compilation, 
+        string symbolName, 
+        bool includePrivateMembers, 
+        bool includeInheritedMembers,
+        bool includeExternalSymbols,
+        string searchMode,
+        CancellationToken cancellationToken) {
+        
+        var symbols = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        
+        // Phase 1: Declaration-based search (existing logic)
+        if (searchMode == "declaration" || searchMode == "all") {
+            var declaredSymbols = GetSymbolsByName(compilation, symbolName, includePrivateMembers, includeInheritedMembers);
+            foreach (var symbol in declaredSymbols) {
+                symbols.Add(symbol);
+            }
+        }
+        
+        // Phase 2: Usage-based search (find symbols used in code)
+        if ((searchMode == "usage" || searchMode == "all") && includeExternalSymbols) {
+            cancellationToken.ThrowIfCancellationRequested();
+            
+            // Performance check - abort if taking too long
+            if (stopwatch.ElapsedMilliseconds > 5000) {
+                return symbols.ToList();
+            }
+            
+            // Try to find external symbols in referenced assemblies
+            if (searchMode == "all" || searchMode == "usage") {
+                foreach (var reference in compilation.References.OfType<PortableExecutableReference>()) {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    
+                    var assemblySymbol = compilation.GetAssemblyOrModuleSymbol(reference) as IAssemblySymbol;
+                    if (assemblySymbol != null) {
+                        // Search in global namespace
+                        SearchInNamespace(assemblySymbol.GlobalNamespace, symbolName, symbols, includePrivateMembers);
+                    }
+                    
+                    // Performance check
+                    if (stopwatch.ElapsedMilliseconds > 8000) {
+                        break;
+                    }
+                }
+            }
+            
+            foreach (var syntaxTree in compilation.SyntaxTrees) {
+                cancellationToken.ThrowIfCancellationRequested();
+                
+                var semanticModel = compilation.GetSemanticModel(syntaxTree);
+                var root = await syntaxTree.GetRootAsync(cancellationToken);
+                
+                // Find all identifiers that match the symbol name
+                var identifiers = root.DescendantNodes()
+                    .OfType<IdentifierNameSyntax>()
+                    .Where(id => id.Identifier.Text.Equals(symbolName, StringComparison.OrdinalIgnoreCase));
+                
+                // Also include generic name syntax for types like ILogger<T>
+                var genericNames = root.DescendantNodes()
+                    .OfType<GenericNameSyntax>()
+                    .Where(gn => gn.Identifier.Text.Equals(symbolName, StringComparison.OrdinalIgnoreCase));
+                
+                foreach (var identifier in identifiers) {
+                    // Performance check
+                    if (stopwatch.ElapsedMilliseconds > 10000) {
+                        // Taking too long, return what we have
+                        return symbols.ToList();
+                    }
+                    
+                    var symbolInfo = semanticModel.GetSymbolInfo(identifier, cancellationToken);
+                    
+                    // Add the symbol if found
+                    if (symbolInfo.Symbol != null) {
+                        // Check accessibility
+                        if (includePrivateMembers || symbolInfo.Symbol.DeclaredAccessibility != Accessibility.Private) {
+                            symbols.Add(symbolInfo.Symbol);
+                        }
+                    }
+                    
+                    // Also check candidate symbols (for ambiguous references)
+                    foreach (var candidate in symbolInfo.CandidateSymbols) {
+                        if (includePrivateMembers || candidate.DeclaredAccessibility != Accessibility.Private) {
+                            symbols.Add(candidate);
+                        }
+                    }
+                }
+                
+                // Process generic names (e.g., ILogger<T>)
+                foreach (var genericName in genericNames) {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    
+                    // Performance check
+                    if (stopwatch.ElapsedMilliseconds > 10000) {
+                        return symbols.ToList();
+                    }
+                    
+                    var symbolInfo = semanticModel.GetSymbolInfo(genericName, cancellationToken);
+                    
+                    if (symbolInfo.Symbol != null) {
+                        if (includePrivateMembers || symbolInfo.Symbol.DeclaredAccessibility != Accessibility.Private) {
+                            symbols.Add(symbolInfo.Symbol);
+                        }
+                    }
+                    
+                    foreach (var candidate in symbolInfo.CandidateSymbols) {
+                        if (includePrivateMembers || candidate.DeclaredAccessibility != Accessibility.Private) {
+                            symbols.Add(candidate);
+                        }
+                    }
+                }
+                
+                // Also look for member access expressions (e.g., logger.LogInformation)
+                var memberAccess = root.DescendantNodes()
+                    .OfType<MemberAccessExpressionSyntax>()
+                    .Where(ma => ma.Name.Identifier.Text.Equals(symbolName, StringComparison.OrdinalIgnoreCase));
+                
+                foreach (var access in memberAccess) {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    
+                    var symbolInfo = semanticModel.GetSymbolInfo(access.Name, cancellationToken);
+                    if (symbolInfo.Symbol != null) {
+                        if (includePrivateMembers || symbolInfo.Symbol.DeclaredAccessibility != Accessibility.Private) {
+                            symbols.Add(symbolInfo.Symbol);
+                        }
+                    }
+                }
+            }
+        }
+        
+        return symbols.ToList();
+    }
+
+    private static async Task<string> GetContextText(Document document, Location location, CancellationToken cancellationToken) {
+        try {
+            var sourceText = await document.GetTextAsync(cancellationToken);
+            var lineSpan = location.GetLineSpan();
+            var line = sourceText.Lines[lineSpan.StartLinePosition.Line];
+            return line.ToString().Trim();
+        } catch {
+            return "";
+        }
+    }
+    
+    private static void SearchInNamespace(INamespaceSymbol namespaceSymbol, string symbolName, HashSet<ISymbol> symbols, bool includePrivateMembers) {
+        // Search types in this namespace
+        foreach (var type in namespaceSymbol.GetTypeMembers()) {
+            if (type.Name.Equals(symbolName, StringComparison.OrdinalIgnoreCase)) {
+                if (includePrivateMembers || type.DeclaredAccessibility != Accessibility.Private) {
+                    symbols.Add(type);
+                }
+            }
+            
+            // Search members in the type
+            foreach (var member in type.GetMembers()) {
+                if (member.Name.Equals(symbolName, StringComparison.OrdinalIgnoreCase)) {
+                    if (includePrivateMembers || member.DeclaredAccessibility != Accessibility.Private) {
+                        symbols.Add(member);
+                    }
+                }
+            }
+        }
+        
+        // Recursively search child namespaces
+        foreach (var childNamespace in namespaceSymbol.GetNamespaceMembers()) {
+            SearchInNamespace(childNamespace, symbolName, symbols, includePrivateMembers);
+        }
+    }
 }

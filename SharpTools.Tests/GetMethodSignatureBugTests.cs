@@ -160,15 +160,16 @@ projectFile,
 CancellationToken.None);
 
 // Assert
-Console.WriteLine($"Result for System.Int32: {result}");
+var resultJson = result?.ToString() ?? "";
+Console.WriteLine($"Result for System.Int32: {resultJson}");
 
 // int版のメソッドが返されているかチェック
-Assert.IsTrue(result.Contains("Process(int input)"), 
-$"Expected int version but got: {result}");
+Assert.IsTrue(resultJson.Contains("Process(int input)"), 
+$"Expected int version but got: {resultJson}");
 
 // 間違ってdouble版が返されていないかチェック
-Assert.IsFalse(result.Contains("Process(double input)"), 
-$"Should not return double version but got: {result}");
+Assert.IsFalse(resultJson.Contains("Process(double input)"), 
+$"Should not return double version but got: {resultJson}");
 }
 
 /// <summary>
@@ -192,15 +193,16 @@ projectFile,
 CancellationToken.None);
 
 // Assert
-Console.WriteLine($"Result for System.String: {result}");
+var resultJson = result?.ToString() ?? "";
+Console.WriteLine($"Result for System.String: {resultJson}");
 
 // string版のメソッドが返されているかチェック
-Assert.IsTrue(result.Contains("Process(string input)"), 
-$"Expected string version but got: {result}");
+Assert.IsTrue(resultJson.Contains("Process(string input)"), 
+$"Expected string version but got: {resultJson}");
 
 // 間違ってdouble版が返されていないかチェック
-Assert.IsFalse(result.Contains("Process(double input)"), 
-$"Should not return double version but got: {result}");
+Assert.IsFalse(resultJson.Contains("Process(double input)"), 
+$"Should not return double version but got: {resultJson}");
 }
 
 /// <summary>
@@ -224,11 +226,12 @@ projectFile,
 CancellationToken.None);
 
 // Assert
-Console.WriteLine($"Result for System.Double: {result}");
+var resultJson = result?.ToString() ?? "";
+Console.WriteLine($"Result for System.Double: {resultJson}");
 
 // double版のメソッドが返されているかチェック
-Assert.IsTrue(result.Contains("Process(double input)"), 
-$"Expected double version but got: {result}");
+Assert.IsTrue(resultJson.Contains("Process(double input)"), 
+$"Expected double version but got: {resultJson}");
 }
 
 /// <summary>
@@ -269,20 +272,25 @@ projectFile,
 "SharpTools.Tests.TestData.OverloadTestClass.Process(System.Double)",
 CancellationToken.None);
 
+// Convert to strings for comparison
+var stringResultJson = stringResult?.ToString() ?? "";
+var intResultJson = intResult?.ToString() ?? "";
+var doubleResultJson = doubleResult?.ToString() ?? "";
+
 // Assert
-Console.WriteLine($"String result: {stringResult}");
-Console.WriteLine($"Int result: {intResult}");
-Console.WriteLine($"Double result: {doubleResult}");
+Console.WriteLine($"String result: {stringResultJson}");
+Console.WriteLine($"Int result: {intResultJson}");
+Console.WriteLine($"Double result: {doubleResultJson}");
 
 // 3つの結果がすべて異なることを確認
-Assert.AreNotEqual(stringResult, intResult, "String and Int results should be different");
-Assert.AreNotEqual(stringResult, doubleResult, "String and Double results should be different");
-Assert.AreNotEqual(intResult, doubleResult, "Int and Double results should be different");
+Assert.AreNotEqual(stringResultJson, intResultJson, "String and Int results should be different");
+Assert.AreNotEqual(stringResultJson, doubleResultJson, "String and Double results should be different");
+Assert.AreNotEqual(intResultJson, doubleResultJson, "Int and Double results should be different");
 
 // それぞれが正しいバージョンを返していることを確認
-Assert.IsTrue(stringResult.Contains("Process(string input)"));
-Assert.IsTrue(intResult.Contains("Process(int input)"));
-Assert.IsTrue(doubleResult.Contains("Process(double input)"));
+Assert.IsTrue(stringResultJson.Contains("Process(string input)"));
+Assert.IsTrue(intResultJson.Contains("Process(int input)"));
+Assert.IsTrue(doubleResultJson.Contains("Process(double input)"));
 }
 }
 }
